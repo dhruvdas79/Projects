@@ -1,0 +1,84 @@
+`timescale 1ns / 1ps
+module d_tlul(
+    input    clk,
+    input  rst,
+    output   req_valid,
+    output    [1:0] req_op,
+    output   [15:0] req_addr,
+    output  [15:0] req_data,
+    output    [1:0]  req_mask,
+    input    a_valid,
+    output   a_ready,
+    input  [2:0] a_opcode,
+    input   [15:0] a_data,
+    input   [1:0]  a_mask,
+    input  [15:0] a_address,
+    input   a_param,
+    input   a_size,
+    input   a_source,
+    output   d_valid,
+    output   [2:0] d_opcode,
+    output   d_error,
+    input  d_ready
+    );
+    localparam GET=3'b100;
+    localparam idle=3'b000;
+    localparam working=3'b001;
+    localparam waiting=3'b010;
+    //opcodes
+    localparam acc_ack=1'b0;
+    localparam acc_ack_data=1'b1;
+    
+    reg [2:0] state,next_state;
+    always@(posedge clk or posedge rst)begin
+        if(rst)begin
+            state=idle;
+            end
+        else
+            state<=next_state;
+       
+    end
+    always@(*)begin
+        next_state=state;
+        case(state)
+        idle:begin
+        if(a_valid)
+            next_state<= working;
+        end
+        working:begin
+          d_valid=1;
+          if(d_ready)
+            next_state<=waiting;
+            end
+            waiting:begin
+            a_valid=1;
+            if(a_ready)
+            next_state<=idle;
+            end
+            end
+            always@(*)begin
+              if (rst) begin
+            d_opcode  <= 0;
+            d_address <= 0;
+            d_data    <= 0;
+            d_mask    <= 0;
+            d_param   <= 0;
+            d_size    <= 0;
+            d_source  <= 0;
+            op        <= 0;
+        end
+        else if (state == idle && a_valid) begin
+            d_address <= req_addr;
+            d_param   <= 0;
+            d_size    <= 1;
+            d_source  <= 0;
+             d_valid = 1;
+                if (a_opcode == GET) begin
+                    d_opcode = ACCESS_ACK_DATA;
+                    d_data   = 16'hABCD;
+                end else begin
+                    d_opcode = ACCESS_ACK;
+            
+               end
+    
+endmodule
