@@ -13,6 +13,23 @@ A collection of RTL and machine-learning projects — from foundational digital-
 
 An edge-deployable thermal object detector (CNN backbone + Swin Transformer attention + YOLOX-style decoupled head), quantized to INT8 via QAT, with synthesizable Verilog RTL for the Swin-attention backbone.
 
+**Architecture**
+
+```mermaid
+flowchart TD
+    A[Thermal Input Frame] --> B["INT8 CNN Backbone"]
+    B --> C["Swin Transformer Attention Block"]
+    C --> D["Split-wise INT8 Q / K / V Projection"]
+    D --> E["Attention RTL Core (Verilog, FPGA)"]
+    E --> F["YOLOX-style Decoupled Head"]
+    F --> G["Bounding Boxes + Class Scores"]
+
+    style E fill:#2d6cdf,color:#fff,stroke:#1a3d7a
+    style B fill:#1e293b,color:#fff
+    style C fill:#1e293b,color:#fff
+    style D fill:#1e293b,color:#fff
+```
+
 - Split-wise INT8 quantization for Q/K/V projections; layer-wise fixed-point inference simulator to validate hardware accuracy pre-RTL
 - 0.9084 mean IoU, 0.000976 box MAE, 100% class-match accuracy (QAT vs. strict-INT8 fidelity)
 - Full-model golden-pass RTL verification at 200 MHz (14,992,460 cycles, 74.96 ms/frame, 13.34 FPS, 0 error vs. software reference)
@@ -28,6 +45,27 @@ An edge-deployable thermal object detector (CNN backbone + Swin Transformer atte
 
 An INT8 QAT-trained TAESD decoder for latent-to-image reconstruction, deployed end-to-end through PyTorch → TensorFlow → TFLite → Edge TPU.
 
+**Architecture**
+
+```mermaid
+flowchart LR
+    A["PyTorch INT8 QAT Model"] --> B["TensorFlow Conversion"]
+    B --> C["TFLite Conversion"]
+    C --> D["Edge TPU Compiler"]
+    D --> P1["Graph Partition 1"]
+    D --> P2["Graph Partition 2"]
+    D --> P3["Graph Partition 3"]
+    D --> P4["Graph Partition 4"]
+    P1 --> E["Google Coral Edge TPU"]
+    P2 --> E
+    P3 --> E
+    P4 --> E
+    E --> F["Reconstructed Image (120 dB PSNR)"]
+
+    style E fill:#2d6cdf,color:#fff,stroke:#1a3d7a
+    style D fill:#1e293b,color:#fff
+```
+
 - Redesigned as four independently calibrated graph partitions — 100% Edge TPU operator mapping (53/53 ops), vs. ~58% for the monolithic graph
 - 120 dB PSNR, ~740 ms average hardware latency
 - Replaced Edge TPU-incompatible residual-add connections with concatenation + 1×1 convolution blocks, eliminating CPU fallback
@@ -41,6 +79,27 @@ An INT8 QAT-trained TAESD decoder for latent-to-image reconstruction, deployed e
 
 A classic 5-stage (IF–ID–EX–MEM–WB) pipelined implementation of the RV32I ISA in Verilog HDL.
 
+**Architecture**
+
+```mermaid
+flowchart LR
+    IF["IF: Instruction Fetch"] --> ID["ID: Decode / Reg Read"]
+    ID --> EX["EX: ALU Execute"]
+    EX --> MEM["MEM: Data Memory Access"]
+    MEM --> WB["WB: Register Write-Back"]
+
+    EX -. "EX/MEM Forward" .-> EX
+    MEM -. "MEM/WB Forward" .-> EX
+    ID -. "Hazard Detect → Stall" .-> IF
+    EX -. "Branch/Jump → Flush" .-> ID
+
+    style IF fill:#1e293b,color:#fff
+    style ID fill:#1e293b,color:#fff
+    style EX fill:#2d6cdf,color:#fff
+    style MEM fill:#1e293b,color:#fff
+    style WB fill:#1e293b,color:#fff
+```
+
 - Hazard-detection unit for load-use and memory hazards
 - EX/MEM and MEM/WB data forwarding to resolve RAW hazards
 - Pipeline-flush logic for branch/jump control hazards
@@ -53,6 +112,30 @@ A classic 5-stage (IF–ID–EX–MEM–WB) pipelined implementation of the RV32
 `/systolic4x4ws`
 
 A 4×4 (16-PE) INT8 output-stationary systolic array for matrix multiplication, implemented in Verilog RTL and deployed on the PYNQ-Z2 (Zynq-7020).
+
+**Architecture**
+
+```mermaid
+flowchart TD
+    AXI["AXI4-Lite Wrapper (9 pins ext I/O)"] --> PE00
+    subgraph SA [" 4x4 INT8 Output-Stationary PE Array "]
+        PE00((PE00)) --> PE01((PE01)) --> PE02((PE02)) --> PE03((PE03))
+        PE10((PE10)) --> PE11((PE11)) --> PE12((PE12)) --> PE13((PE13))
+        PE20((PE20)) --> PE21((PE21)) --> PE22((PE22)) --> PE23((PE23))
+        PE30((PE30)) --> PE31((PE31)) --> PE32((PE32)) --> PE33((PE33))
+        PE00 --> PE10 --> PE20 --> PE30
+        PE01 --> PE11 --> PE21 --> PE31
+        PE02 --> PE12 --> PE22 --> PE32
+        PE03 --> PE13 --> PE23 --> PE33
+    end
+    PE03 --> OUT["Output Accumulators"]
+    PE13 --> OUT
+    PE23 --> OUT
+    PE33 --> OUT
+
+    style AXI fill:#2d6cdf,color:#fff
+    style OUT fill:#2d6cdf,color:#fff
+```
 
 - 1.6 GMAC/s (3.2 GOPS) at 100 MHz
 - 100% functional match against a software golden model across four test cases; timing closure achieved (WNS +0.425 ns)
