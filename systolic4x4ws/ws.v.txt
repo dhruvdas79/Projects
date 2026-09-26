@@ -1,0 +1,314 @@
+// ============================================================
+// FIXED & OPTIMISED 4x4 Signed INT8 Systolic-Array Matrix Accelerator
+// Top module: top_systolic_accelerator
+// ============================================================
+
+// ------------------------------------------------------------
+// 1. Processing Element (PE)
+//    Each PE performs: acc_out = acc_out + a_in * b_in
+// ------------------------------------------------------------
+module pe
+#(
+    parameter DATA_W = 8,
+    parameter ACC_W  = 32
+)
+(
+    input  clk,
+    input  rst,
+    input  signed [DATA_W-1:0] a_in,
+    input  signed [DATA_W-1:0] b_in,
+    output reg signed [DATA_W-1:0] a_out,
+    output reg signed [DATA_W-1:0] b_out,
+    output reg signed [ACC_W-1:0]  acc_out
+);
+
+always @(posedge clk) begin
+    if (rst) begin
+        a_out   <= 0;
+        b_out   <= 0;
+        acc_out <= 0;
+    end else begin
+        a_out   <= a_in;
+        b_out   <= b_in;
+        acc_out <= acc_out + (a_in * b_in);
+    end
+end
+
+endmodule
+
+// ------------------------------------------------------------
+// 2. Skew Buffer for Matrix A row feeding
+//    out0 has 0-cycle delay, out1 has 1-cycle delay,
+//    out2 has 2-cycle delay, out3 has 3-cycle delay.
+// ------------------------------------------------------------
+module skew_buffer (
+    input clk,
+    input rst,
+    input signed [7:0] in0,
+    input signed [7:0] in1,
+    input signed [7:0] in2,
+    input signed [7:0] in3,
+    output reg signed [7:0] out0,
+    output reg signed [7:0] out1,
+    output reg signed [7:0] out2,
+    output reg signed [7:0] out3
+);
+
+reg signed [7:0] d1_1;
+reg signed [7:0] d2_1, d2_2;
+reg signed [7:0] d3_1, d3_2, d3_3;
+
+always @(posedge clk) begin
+    if (rst) begin
+        out0 <= 0; out1 <= 0; out2 <= 0; out3 <= 0;
+        d1_1 <= 0;
+        d2_1 <= 0; d2_2 <= 0;
+        d3_1 <= 0; d3_2 <= 0; d3_3 <= 0;
+    end else begin
+        out0 <= in0;
+
+        d1_1 <= in1;
+        out1 <= d1_1;
+
+        d2_1 <= in2;
+        d2_2 <= d2_1;
+        out2 <= d2_2;
+
+        d3_1 <= in3;
+        d3_2 <= d3_1;
+        d3_3 <= d3_2;
+        out3 <= d3_3;
+    end
+end
+
+endmodule
+
+// ------------------------------------------------------------
+// 3. Matrix-A Loader
+//    A is written column-wise.
+//    Each 32-bit word stores one column:
+//      wr_data = {A[3][col], A[2][col], A[1][col], A[0][col]}
+// ------------------------------------------------------------
+module matrix4x4_loader (
+    input clk,
+    input rst,
+
+    input        wr_en,
+    input  [1:0] wr_col,
+    input  [31:0] wr_data,
+
+    input        rd_en,
+    input  [1:0] rd_col,
+
+    output signed [7:0] row0_out,
+    output signed [7:0] row1_out,
+    output signed [7:0] row2_out,
+    output signed [7:0] row3_out
+);
+
+reg [31:0] mem [0:3];
+reg [31:0] rd_data;
+
+always @(posedge clk) begin
+    if (rst) begin
+        rd_data <= 0;
+    end else begin
+        if (wr_en)
+            mem[wr_col] <= wr_data;
+
+        if (rd_en)
+            rd_data <= mem[rd_col];
+        else
+            rd_data <= 0;
+    end
+end
+
+wire signed [7:0] in0, in1, in2, in3;
+assign {in3, in2, in1, in0} = rd_data;
+
+skew_buffer skewA (
+    .clk(clk), .rst(rst),
+    .in0(in0), .in1(in1), .in2(in2), .in3(in3),
+    .out0(row0_out), .out1(row1_out),
+    .out2(row2_out), .out3(row3_out)
+);
+
+endmodule
+
+// ------------------------------------------------------------
+// 4. Matrix-B Loader
+//    B is written row-wise.
+//    Each 32-bit word stores one row:
+//      wr_data = {B[row][3], B[row][2], B[row][1], B[row][0]}
+// ------------------------------------------------------------
+module matrix4x4_loader_B (
+    input clk,
+    input rst,
+
+    input        wr_en,
+    input  [1:0] wr_row,
+    input  [31:0] wr_data,
+
+    input        rd_en,
+    input  [1:0] rd_row,
+
+    output reg signed [7:0] col0_out,
+    output reg signed [7:0] col1_out,
+    output reg signed [7:0] col2_out,
+    output reg signed [7:0] col3_out
+);
+
+reg [31:0] mem [0:3];
+reg [31:0] rd_data;
+
+always @(posedge clk) begin
+    if (rst) begin
+        rd_data <= 0;
+    end else begin
+        if (wr_en)
+            mem[wr_row] <= wr_data;
+
+        if (rd_en)
+            rd_data <= mem[rd_row];
+        else
+            rd_data <= 0;
+    end
+end
+
+wire signed [7:0] in0, in1, in2, in3;
+assign {in3, in2, in1, in0} = rd_data;
+
+reg signed [7:0] d1_1;
+reg signed [7:0] d2_1, d2_2;
+reg signed [7:0] d3_1, d3_2, d3_3;
+
+always @(posedge clk) begin
+    if (rst) begin
+        col0_out <= 0; col1_out <= 0; col2_out <= 0; col3_out <= 0;
+        d1_1 <= 0;
+        d2_1 <= 0; d2_2 <= 0;
+        d3_1 <= 0; d3_2 <= 0; d3_3 <= 0;
+    end else begin
+        col0_out <= in0;
+
+        d1_1 <= in1;
+        col1_out <= d1_1;
+
+        d2_1 <= in2;
+        d2_2 <= d2_1;
+        col2_out <= d2_2;
+
+        d3_1 <= in3;
+        d3_2 <= d3_1;
+        d3_3 <= d3_2;
+        col3_out <= d3_3;
+    end
+end
+
+endmodule
+
+// ------------------------------------------------------------
+// 5. 4x4 Systolic Array Core
+// ------------------------------------------------------------
+module systolic_array_4x4 (
+    input clk,
+    input rst,
+
+    input signed [7:0] a0, a1, a2, a3,
+    input signed [7:0] b0, b1, b2, b3,
+
+    output signed [31:0] c00, c01, c02, c03,
+    output signed [31:0] c10, c11, c12, c13,
+    output signed [31:0] c20, c21, c22, c23,
+    output signed [31:0] c30, c31, c32, c33
+);
+
+wire signed [7:0] a01, a02, a03;
+wire signed [7:0] a11, a12, a13;
+wire signed [7:0] a21, a22, a23;
+wire signed [7:0] a31, a32, a33;
+
+wire signed [7:0] b10, b20, b30;
+wire signed [7:0] b11, b21, b31;
+wire signed [7:0] b12, b22, b32;
+wire signed [7:0] b13, b23, b33;
+
+// Row 0
+pe pe00(.clk(clk), .rst(rst), .a_in(a0),  .b_in(b0),  .a_out(a01), .b_out(b10), .acc_out(c00));
+pe pe01(.clk(clk), .rst(rst), .a_in(a01), .b_in(b1),  .a_out(a02), .b_out(b11), .acc_out(c01));
+pe pe02(.clk(clk), .rst(rst), .a_in(a02), .b_in(b2),  .a_out(a03), .b_out(b12), .acc_out(c02));
+pe pe03(.clk(clk), .rst(rst), .a_in(a03), .b_in(b3),  .a_out(),    .b_out(b13), .acc_out(c03));
+
+// Row 1
+pe pe10(.clk(clk), .rst(rst), .a_in(a1),  .b_in(b10), .a_out(a11), .b_out(b20), .acc_out(c10));
+pe pe11(.clk(clk), .rst(rst), .a_in(a11), .b_in(b11), .a_out(a12), .b_out(b21), .acc_out(c11));
+pe pe12(.clk(clk), .rst(rst), .a_in(a12), .b_in(b12), .a_out(a13), .b_out(b22), .acc_out(c12));
+pe pe13(.clk(clk), .rst(rst), .a_in(a13), .b_in(b13), .a_out(),    .b_out(b23), .acc_out(c13));
+
+// Row 2
+pe pe20(.clk(clk), .rst(rst), .a_in(a2),  .b_in(b20), .a_out(a21), .b_out(b30), .acc_out(c20));
+pe pe21(.clk(clk), .rst(rst), .a_in(a21), .b_in(b21), .a_out(a22), .b_out(b31), .acc_out(c21));
+pe pe22(.clk(clk), .rst(rst), .a_in(a22), .b_in(b22), .a_out(a23), .b_out(b32), .acc_out(c22));
+pe pe23(.clk(clk), .rst(rst), .a_in(a23), .b_in(b23), .a_out(),    .b_out(b33), .acc_out(c23));
+
+// Row 3
+pe pe30(.clk(clk), .rst(rst), .a_in(a3),  .b_in(b30), .a_out(a31), .b_out(), .acc_out(c30));
+pe pe31(.clk(clk), .rst(rst), .a_in(a31), .b_in(b31), .a_out(a32), .b_out(), .acc_out(c31));
+pe pe32(.clk(clk), .rst(rst), .a_in(a32), .b_in(b32), .a_out(a33), .b_out(), .acc_out(c32));
+pe pe33(.clk(clk), .rst(rst), .a_in(a33), .b_in(b33), .a_out(),    .b_out(), .acc_out(c33));
+
+endmodule
+
+// ------------------------------------------------------------
+// 6. Top-Level Module
+// ------------------------------------------------------------
+module top_systolic_accelerator (
+    input clk,
+    input rst,
+
+    input        wr_en_a,
+    input  [1:0] wr_col_a,
+    input  [31:0] wr_data_a,
+    input        rd_en_a,
+    input  [1:0] rd_col_a,
+
+    input        wr_en_b,
+    input  [1:0] wr_row_b,
+    input  [31:0] wr_data_b,
+    input        rd_en_b,
+    input  [1:0] rd_row_b,
+
+    output signed [31:0] c00, c01, c02, c03,
+    output signed [31:0] c10, c11, c12, c13,
+    output signed [31:0] c20, c21, c22, c23,
+    output signed [31:0] c30, c31, c32, c33
+);
+
+wire signed [7:0] a0, a1, a2, a3;
+wire signed [7:0] b0, b1, b2, b3;
+
+matrix4x4_loader loaderA (
+    .clk(clk), .rst(rst),
+    .wr_en(wr_en_a), .wr_col(wr_col_a), .wr_data(wr_data_a),
+    .rd_en(rd_en_a), .rd_col(rd_col_a),
+    .row0_out(a0), .row1_out(a1), .row2_out(a2), .row3_out(a3)
+);
+
+matrix4x4_loader_B loaderB (
+    .clk(clk), .rst(rst),
+    .wr_en(wr_en_b), .wr_row(wr_row_b), .wr_data(wr_data_b),
+    .rd_en(rd_en_b), .rd_row(rd_row_b),
+    .col0_out(b0), .col1_out(b1), .col2_out(b2), .col3_out(b3)
+);
+
+systolic_array_4x4 SA (
+    .clk(clk), .rst(rst),
+    .a0(a0), .a1(a1), .a2(a2), .a3(a3),
+    .b0(b0), .b1(b1), .b2(b2), .b3(b3),
+    .c00(c00), .c01(c01), .c02(c02), .c03(c03),
+    .c10(c10), .c11(c11), .c12(c12), .c13(c13),
+    .c20(c20), .c21(c21), .c22(c22), .c23(c23),
+    .c30(c30), .c31(c31), .c32(c32), .c33(c33)
+);
+
+endmodule
