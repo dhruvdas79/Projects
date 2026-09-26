@@ -1,0 +1,487 @@
+`timescale 1ns/1ps
+// ============================================================================
+// Shared 16-lane DSP-pipelined residual align-and-add.
+//
+// RESPIPE_V1:
+//   Stage 1  : exact signed-INT8 x unsigned-16 partial products
+//   Stage 2  : reconstruct exact signed-INT8 x unsigned-32 product
+//   Stage 3A : exact rounding preparation (magnitude/bias), REGISTERED
+//   Stage 3B : exact variable shift + sign restoration, REGISTERED
+//   Stage 4  : aligned outputs + residual add + INT8 saturation
+//
+// Stage 3A/3B is bit-equivalent to fixedpoint_pkg::round_shift_i64():
+//
+//   shift > 0:
+//       positive: ( value + half) >>> shift
+//       negative: -(((-value + half) >>> shift))
+//       half = 1 << (shift-1)
+//
+//   shift < 0:
+//       value <<< (-shift)
+//
+//   shift == 0:
+//       value
+//
+// One extra pipeline cycle is introduced relative to the previous module.
+// ============================================================================
+
+(* use_dsp = "yes" *)
+module requant_add_16lane #(
+  parameter int LANES = 16
+)(
+  input  logic clk,
+  input  logic rst_n,
+
+  input  logic in_valid,
+  input  logic in_half,
+
+  input  logic signed [LANES*8-1:0] a_code,
+  input  logic signed [LANES*8-1:0] b_code,
+
+  input  logic        [31:0] a_mult,
+  input  logic signed [15:0] a_shift,
+
+  input  logic        [31:0] b_mult,
+  input  logic signed [15:0] b_shift,
+
+  output logic out_valid,
+  output logic out_half,
+
+  output logic signed [LANES*64-1:0] a_aligned,
+  output logic signed [LANES*64-1:0] b_aligned,
+  output logic signed [LANES*8-1:0]  y_code
+);
+
+import fixedpoint_pkg::*;
+
+
+// ============================================================================
+// Valid / metadata pipeline
+// ============================================================================
+
+logic s1_valid_q,  s1_half_q;
+logic s2_valid_q,  s2_half_q;
+
+// RESLOCAL_FANOUT_V2: physical register boundary
+logic s2b_valid_q, s2b_half_q;
+
+logic s3a_valid_q, s3a_half_q;
+logic s3_valid_q,  s3_half_q;
+
+
+// ============================================================================
+// Shift metadata
+// ============================================================================
+
+logic signed [15:0] s1_a_shift_q,  s1_b_shift_q;
+logic signed [15:0] s2_a_shift_q,  s2_b_shift_q;
+logic signed [15:0] s2b_a_shift_q, s2b_b_shift_q;
+
+logic signed [15:0] s3a_a_shift_q, s3a_b_shift_q;
+
+
+// ============================================================================
+// Stage 1 partial products
+// ============================================================================
+
+(* use_dsp = "yes" *)
+logic signed [24:0] s1_a_lo_q [0:LANES-1];
+
+(* use_dsp = "yes" *)
+logic signed [24:0] s1_a_hi_q [0:LANES-1];
+
+(* use_dsp = "yes" *)
+logic signed [24:0] s1_b_lo_q [0:LANES-1];
+
+(* use_dsp = "yes" *)
+logic signed [24:0] s1_b_hi_q [0:LANES-1];
+
+
+// ============================================================================
+// Stage 2 reconstructed products
+// ============================================================================
+
+logic signed [40:0] s2_a_product_q [0:LANES-1];
+logic signed [40:0] s2_b_product_q [0:LANES-1];
+
+// ============================================================================
+// Stage 2B exact product timing registers
+// No arithmetic is changed in this stage.
+// ============================================================================
+
+logic signed [40:0] s2b_a_product_q [0:LANES-1];
+logic signed [40:0] s2b_b_product_q [0:LANES-1];
+
+
+// ============================================================================
+// Stage 3A registered rounding preparation
+// ============================================================================
+
+logic signed [63:0] s3a_a_pre_q [0:LANES-1];
+logic signed [63:0] s3a_b_pre_q [0:LANES-1];
+
+logic               s3a_a_negative_q [0:LANES-1];
+logic               s3a_b_negative_q [0:LANES-1];
+
+
+// ============================================================================
+// Stage 3B aligned values
+// ============================================================================
+
+logic signed [63:0] s3_a_aligned_q [0:LANES-1];
+logic signed [63:0] s3_b_aligned_q [0:LANES-1];
+
+
+// ============================================================================
+// Exact DSP-friendly partial multiply
+// ============================================================================
+
+function automatic logic signed [24:0] mul_s8_u16_dsp(
+  input logic signed [7:0] x,
+  input logic        [15:0] m
+);
+  logic signed [16:0] m_pos;
+  begin
+    m_pos = {1'b0,m};
+    mul_s8_u16_dsp = $signed(x) * m_pos;
+  end
+endfunction
+
+
+// ============================================================================
+// Exact reconstruction of signed-INT8 x unsigned-32 product
+// ============================================================================
+
+function automatic logic signed [40:0] join_u32_product(
+  input logic signed [24:0] lo_product,
+  input logic signed [24:0] hi_product
+);
+  logic signed [40:0] lo_ext;
+  logic signed [40:0] hi_ext;
+
+  begin
+    lo_ext = {{16{lo_product[24]}},lo_product};
+    hi_ext = {{16{hi_product[24]}},hi_product};
+
+    join_u32_product = lo_ext + (hi_ext <<< 16);
+  end
+endfunction
+
+
+// ============================================================================
+// Stage 3A
+//
+// This is the first half of fixedpoint_pkg::round_shift_i64().
+//
+// For right shifts we register:
+//
+//     positive : value  + half
+//     negative : -value + half
+//
+// For zero/left shifts the original value is registered unchanged.
+//
+// All operations remain exactly 64-bit signed two's-complement operations.
+// ============================================================================
+
+function automatic logic signed [63:0] round_prepare_i64(
+  input logic signed [63:0] value,
+  input logic signed [15:0] shift
+);
+  logic signed [63:0] half;
+
+  begin
+    if (shift > 0) begin
+
+      half = 64'sd1 <<< (shift - 1);
+
+      if (value >= 0)
+        round_prepare_i64 = value + half;
+      else
+        round_prepare_i64 = -value + half;
+
+    end
+    else begin
+
+      // shift <= 0:
+      // no rounding bias is required.
+      round_prepare_i64 = value;
+
+    end
+  end
+endfunction
+
+
+// ============================================================================
+// Stage 3B
+//
+// Completes fixedpoint_pkg::round_shift_i64() using Stage-3A data.
+// ============================================================================
+
+function automatic logic signed [63:0] round_finish_i64(
+  input logic signed [63:0] prepared_value,
+  input logic signed [15:0] shift,
+  input logic               original_negative
+);
+  logic signed [63:0] shifted_value;
+
+  begin
+
+    if (shift > 0) begin
+
+      shifted_value = prepared_value >>> shift;
+
+      if (original_negative)
+        round_finish_i64 = -shifted_value;
+      else
+        round_finish_i64 = shifted_value;
+
+    end
+    else if (shift < 0) begin
+
+      round_finish_i64 = prepared_value <<< (-shift);
+
+    end
+    else begin
+
+      round_finish_i64 = prepared_value;
+
+    end
+
+  end
+endfunction
+
+
+// ============================================================================
+// Pipeline
+// ============================================================================
+
+always_ff @(posedge clk) begin
+
+  if (!rst_n) begin
+
+    s1_valid_q   <= 1'b0;
+    s2_valid_q   <= 1'b0;
+    s2b_valid_q  <= 1'b0;
+    s3a_valid_q  <= 1'b0;
+    s3_valid_q   <= 1'b0;
+
+    s1_half_q    <= 1'b0;
+    s2_half_q    <= 1'b0;
+    s2b_half_q   <= 1'b0;
+    s3a_half_q   <= 1'b0;
+    s3_half_q    <= 1'b0;
+
+    out_valid    <= 1'b0;
+    out_half     <= 1'b0;
+
+  end
+  else begin
+
+    // ========================================================================
+    // Stage 1
+    // Four DSP-friendly partial products per lane.
+    // ========================================================================
+
+    s1_valid_q <= in_valid;
+    s1_half_q  <= in_half;
+
+    if (in_valid) begin
+
+      s1_a_shift_q <= a_shift;
+      s1_b_shift_q <= b_shift;
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+
+        s1_a_lo_q[lane] <=
+          mul_s8_u16_dsp(
+            $signed(a_code[lane*8+:8]),
+            a_mult[15:0]
+          );
+
+        s1_a_hi_q[lane] <=
+          mul_s8_u16_dsp(
+            $signed(a_code[lane*8+:8]),
+            a_mult[31:16]
+          );
+
+        s1_b_lo_q[lane] <=
+          mul_s8_u16_dsp(
+            $signed(b_code[lane*8+:8]),
+            b_mult[15:0]
+          );
+
+        s1_b_hi_q[lane] <=
+          mul_s8_u16_dsp(
+            $signed(b_code[lane*8+:8]),
+            b_mult[31:16]
+          );
+
+      end
+    end
+
+
+    // ========================================================================
+    // Stage 2
+    // Reconstruct exact signed-INT8 x unsigned-32 products.
+    // ========================================================================
+
+    s2_valid_q <= s1_valid_q;
+    s2_half_q  <= s1_half_q;
+
+    if (s1_valid_q) begin
+
+      s2_a_shift_q <= s1_a_shift_q;
+      s2_b_shift_q <= s1_b_shift_q;
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+
+        s2_a_product_q[lane] <=
+          join_u32_product(
+            s1_a_lo_q[lane],
+            s1_a_hi_q[lane]
+          );
+
+        s2_b_product_q[lane] <=
+          join_u32_product(
+            s1_b_lo_q[lane],
+            s1_b_hi_q[lane]
+          );
+
+      end
+    end
+
+
+    // ========================================================================
+    // Stage 3A
+    // Register the expensive pre-round arithmetic.
+    //
+    // This breaks the previous S2-product -> complete round_shift_i64 path.
+    // ========================================================================
+
+    // ========================================================================
+    // Stage 2B -- RESLOCAL_FANOUT_V2
+    //
+    // Exact register boundary:
+    // S2 reconstructed product -> S2B FF -> Stage3A round_prepare_i64
+    //
+    // Numerical arithmetic is unchanged.
+    // Pipeline latency increases by exactly one clock.
+    // ========================================================================
+
+    s2b_valid_q <= s2_valid_q;
+    s2b_half_q  <= s2_half_q;
+
+    if (s2_valid_q) begin
+
+      s2b_a_shift_q <= s2_a_shift_q;
+      s2b_b_shift_q <= s2_b_shift_q;
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+        s2b_a_product_q[lane] <= s2_a_product_q[lane];
+        s2b_b_product_q[lane] <= s2_b_product_q[lane];
+      end
+    end
+
+
+    s3a_valid_q <= s2b_valid_q;
+    s3a_half_q  <= s2b_half_q;
+
+    if (s2b_valid_q) begin
+
+      s3a_a_shift_q <= s2b_a_shift_q;
+      s3a_b_shift_q <= s2b_b_shift_q;
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+
+        s3a_a_negative_q[lane] <= s2b_a_product_q[lane][40];
+        s3a_b_negative_q[lane] <= s2b_b_product_q[lane][40];
+
+        s3a_a_pre_q[lane] <=
+          round_prepare_i64(
+            {{23{s2b_a_product_q[lane][40]}},
+             s2b_a_product_q[lane]},
+            s2_a_shift_q
+          );
+
+        s3a_b_pre_q[lane] <=
+          round_prepare_i64(
+            {{23{s2b_b_product_q[lane][40]}},
+             s2b_b_product_q[lane]},
+            s2_b_shift_q
+          );
+
+      end
+    end
+
+
+    // ========================================================================
+    // Stage 3B
+    // Complete shift/sign restoration.
+    // ========================================================================
+
+    s3_valid_q <= s3a_valid_q;
+    s3_half_q  <= s3a_half_q;
+
+    if (s3a_valid_q) begin
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+
+        s3_a_aligned_q[lane] <=
+          round_finish_i64(
+            s3a_a_pre_q[lane],
+            s3a_a_shift_q,
+            s3a_a_negative_q[lane]
+          );
+
+        s3_b_aligned_q[lane] <=
+          round_finish_i64(
+            s3a_b_pre_q[lane],
+            s3a_b_shift_q,
+            s3a_b_negative_q[lane]
+          );
+
+      end
+    end
+
+
+    // ========================================================================
+    // Final stage
+    // Preserve aligned values and saturate residual sum.
+    // ========================================================================
+
+    out_valid <= s3_valid_q;
+    out_half  <= s3_half_q;
+
+    if (s3_valid_q) begin
+
+      for (int lane=0; lane<LANES; lane=lane+1) begin
+
+        a_aligned[lane*64+:64] <= s3_a_aligned_q[lane];
+        b_aligned[lane*64+:64] <= s3_b_aligned_q[lane];
+
+        y_code[lane*8+:8] <=
+          fixedpoint_pkg::sat_s8(
+            s3_a_aligned_q[lane] +
+            s3_b_aligned_q[lane]
+          );
+
+      end
+    end
+
+  end
+end
+
+
+`ifndef SYNTHESIS
+
+initial begin
+  if (LANES != 16)
+    $fatal(
+      1,
+      "requant_add_16lane RESPIPE_V1 requires LANES=16"
+    );
+end
+
+`endif
+
+endmodule

@@ -1,0 +1,1519 @@
+`timescale 1ns/1ps
+import post_swin_stage_cfg_pkg::*;
+// ============================================================================
+// post_swin_continuous_tensor_adapter.sv
+//
+// Synthesizable continuous post-Swin activation graph.  Unlike the V5 profiled
+// adapter, this module never reads a per-stage 00_input_q_i8.mem file.
+//
+// Exact graph implemented here:
+//   stage 0 input = requant_add(P3 Swin, nearest-neighbour upsample2x(P4 Swin))
+//   stage 1 input = stage 0 output
+//   stage 2 input = requant_add(P4 Swin, stage 1 output)
+//   stage 3 input = stage 2 output
+//   stage 4 input = requant_add(P5 projection, stage 3 output)
+//   stage 5 input = stage 0 output (P3 head)
+//   stage13 input = stage 2 output (P4 head)
+//   stage21 input = stage 4 output (P5 head)
+//   all cls/reg/obj branches consume outputs produced by preceding RTL stages.
+//
+// Activations are stored as 32 INT8 lanes per 256-bit word.  The arrays are
+// synchronous-read URAM-style memories.  The shared MAC service presents token
+// N for a full cycle, so token N+1 is prefetched while token N is consumed.
+//
+// FPN fusion uses exact Q30 scale conversion and saturating addition.  Eight
+// lanes are processed per cycle to keep the fusion datapath small and to avoid
+// adding another physical 32x32 compute array.
+// ============================================================================
+(* use_dsp = "no" *)
+module post_swin_continuous_tensor_adapter #(
+  parameter int PE_K = 32,
+  parameter int PE_N = 32,
+  parameter int FUSION_LANES = 4
+)(
+  input  logic clk,
+  input  logic rst_n,
+  input  logic run_start,
+
+  input  logic [4:0] stage_id,
+  input  logic       stage_prepare_req,
+  output logic       tensor_prepare_done,
+
+  input  logic                         adapter_stream_valid,
+  input  logic [11:0]                  adapter_token,
+  input  logic [5:0]                   adapter_ci_tile,
+
+  // ADDRPIPE2_V1 prefill timing from shared-MAC weight-load phase.
+  input  logic                         adapter_weight_row_load,
+  input  logic [4:0]                   adapter_weight_row_index,
+
+  output logic signed [8:0]            adapter_input_vector [0:PE_K-1],
+
+  input  logic                         out_valid,
+  input  logic [4:0]                   out_stage_id,
+  input  logic [11:0]                  out_token,
+  input  logic [5:0]                   out_co_tile,
+  input  logic [31:0]                  out_lane_mask,
+  input  logic signed [7:0]            out_data [0:PE_N-1],
+
+  // Final Swin tensors use the existing 16-lane read interfaces.
+  output logic                         p4_src_rd_en,
+  output logic [9:0]                   p4_src_rd_pixel,
+  output logic [2:0]                   p4_src_rd_co_tile,
+  input  logic                         p4_src_rd_valid,
+  input  logic signed [127:0]          p4_src_rd_data,
+
+  output logic                         p3_src_rd_en,
+  output logic [11:0]                  p3_src_rd_pixel,
+  output logic [2:0]                   p3_src_rd_co_tile,
+  input  logic                         p3_src_rd_valid,
+  input  logic signed [127:0]          p3_src_rd_data,
+
+  // P5 projection is captured during the projection stage.
+  input  logic                         p5_proj_valid,
+  input  logic [11:0]                  p5_proj_pixel,
+  input  logic [1:0]                   p5_proj_co_tile,
+  input  logic signed [255:0]          p5_proj_data,
+
+  output logic                         fusion_busy,
+  output logic [1:0]                   fusion_kind,
+  output logic [13:0]                  fusion_word_index,
+  output logic [13:0]                  p5_capture_count,
+  output logic                         graph_error
+);
+  localparam int P3_WORDS  = 52*52*4;
+  localparam int P4_WORDS  = 26*26*4;
+  localparam int P5_WORDS  = 13*13*4;
+  localparam int MAX_WORDS = P3_WORDS;
+  localparam int GROUPS_PER_WORD = 32/FUSION_LANES;
+
+  // Exact fusion scale ratios, Q30, verified over every exported element.
+  localparam logic signed [31:0] TD_A_M = 32'sd846509655;
+  localparam logic signed [31:0] TD_B_M = 32'sd784842600;
+  localparam logic signed [31:0] BU_A_M = 32'sd780245619;
+  localparam logic signed [31:0] BU_B_M = 32'sd772396527;
+  localparam logic signed [31:0] P5_A_M = 32'sd830317083;
+  localparam logic signed [31:0] P5_B_M = 32'sd1070921573;
+  localparam int FUSION_SHIFT = 30;
+
+  // Persistent FPN features and three reusable branch scratch buffers.
+  (* ram_style = "block" *) logic [255:0] p4_fpn_mem    [0:P4_WORDS-1];
+  // P5 projection is first captured in p5_fpn_mem.  Stage-4 fusion reads it
+  // completely before stage-4 convolution overwrites the same bank with the
+  // final P5 FPN feature.  This removes the former duplicate P5 source bank.
+  (* ram_style = "block" *) logic [255:0] p5_fpn_mem    [0:P5_WORDS-1];
+  typedef enum logic [3:0] {
+    F_IDLE,
+    F_PRIME,
+    F_INTERNAL_CAPTURE,
+    F_EXT_LO,
+    F_EXT_HI_WAIT,
+    F_EXT_HI,
+    F_CALC,
+      F_CALC_DRAIN,
+    F_WRITE,
+    F_DONE
+  } fusion_state_t;
+
+  fusion_state_t fusion_state_q;
+  logic [1:0]  fusion_kind_q;
+  logic [13:0] fusion_word_q;
+
+  // FUSION_P4_COUNTER_V1_IMPLEMENTED
+  // Incremental 52x52 -> 26x26 nearest-neighbour source address.
+  // Removes div52 / row reconstruction from the P4 read timing path.
+  // No pipeline stage or fusion FSM state is added.
+  logic [5:0] fusion_x52_q;
+  logic       fusion_y52_odd_q;
+  logic [9:0] fusion_p4_token_q;
+
+  logic [2:0]  fusion_group_q;
+  logic [255:0] fusion_src_a_q;
+  logic [255:0] fusion_src_b_q;
+
+  logic [255:0] fusion_result_q;
+
+  // ========================================================================
+  // FUSIONPIPE_V1_IMPLEMENTED
+  //
+  // ISCAS-2019-style arithmetic segmentation:
+  //
+  // fusion_src -> exact 8x32 product -> REGISTER
+  //            -> exact Q30 round/add/saturate -> fusion_result
+  //
+  // Arithmetic is bit-exact with the original sat_add_scaled path.
+  // ========================================================================
+
+  logic                     fusion_mul_valid_q;
+  logic [2:0]               fusion_mul_group_q;
+
+  logic signed [39:0]       fusion_mul_a_q [0:FUSION_LANES-1];
+  logic signed [39:0]       fusion_mul_b_q [0:FUSION_LANES-1];
+
+  logic [4:0] prepared_stage_q;
+  logic prepared_valid_q;
+
+  // POSTSWIN_ADDRCTRL_V1:
+  // Decode stage configuration once at stage preparation, rather than
+  // recomputing stage_* functions from stage_id on every prefetch cycle.
+  //
+  // max_fanout asks synthesis to replicate these cheap FFs where useful,
+  // trading abundant FF capacity for shorter local routing.
+  (* max_fanout = 8 *) logic [4:0]  cfg_stage_q;
+  (* max_fanout = 8 *) logic        cfg_valid_q;
+  (* max_fanout = 8 *) logic [11:0] cfg_tokens_m1_q;
+  (* max_fanout = 8 *) logic [6:0]  cfg_w_out_q;
+  (* max_fanout = 8 *) logic [6:0]  cfg_w_in_q;
+  (* max_fanout = 8 *) logic [6:0]  cfg_h_in_q;
+  (* max_fanout = 8 *) logic [1:0]  cfg_kw_q;
+  (* max_fanout = 8 *) logic [1:0]  cfg_stride_q;
+  (* max_fanout = 8 *) logic [1:0]  cfg_pad_q;
+  (* max_fanout = 8 *) logic [2:0]  cfg_source_sel_q;
+
+  // V65_MEMALLOC_V3: one physical synchronous read register per activation
+  // array.  Vivado cannot map several independent arrays to BRAM/URAM when
+  // their indexed reads all assign one shared output register.
+  logic [255:0] input_word_selected;
+  logic [2:0]   input_source_sel_q;
+  logic         input_prefetch_valid_q;
+
+  logic         p3_mem_rd_en;
+  logic [13:0]  p3_mem_rd_addr;
+  logic [255:0] p3_mem_rd_q;
+  logic         p4_mem_rd_en;
+  logic [13:0]  p4_mem_rd_addr;
+  logic [255:0] p4_mem_rd_q;
+  logic         p5_mem_rd_en;
+  logic [13:0]  p5_mem_rd_addr;
+  logic [255:0] p5_mem_rd_q;
+  logic         scratch_a_mem_rd_en;
+  logic [13:0]  scratch_a_mem_rd_addr;
+  logic [255:0] scratch_a_mem_rd_q;
+  logic         scratch_b_mem_rd_en;
+  logic [13:0]  scratch_b_mem_rd_addr;
+  logic [255:0] scratch_b_mem_rd_q;
+  logic         scratch_c_mem_rd_en;
+  logic [13:0]  scratch_c_mem_rd_addr;
+  logic [255:0] scratch_c_mem_rd_q;
+
+  (* max_fanout = 8 *) logic [13:0] input_prefetch_addr;
+  (* max_fanout = 8 *) logic        input_prefetch_valid;
+  (* max_fanout = 8 *) logic [2:0]  input_source_sel;
+
+  logic        stage_write_en;
+  logic [2:0]  stage_write_sel;
+  logic [13:0] stage_write_addr;
+  logic [255:0] stage_write_data;
+
+  logic        fusion_write_en;
+  logic [13:0] fusion_write_addr;
+  logic [255:0] fusion_write_data;
+
+  logic [13:0] p5_write_addr;
+  // Explicit one-write-port tuples.  Every memory is written and read from a
+  // single sequential process so the intended 1W+1R topology is unambiguous.
+  logic        p3_mem_wr_en;
+  logic [13:0] p3_mem_wr_addr;
+  logic [255:0] p3_mem_wr_data;
+  logic        p4_mem_wr_en;
+  logic [13:0] p4_mem_wr_addr;
+  logic [255:0] p4_mem_wr_data;
+  logic        p5_mem_wr_en;
+  logic [13:0] p5_mem_wr_addr;
+  logic [255:0] p5_mem_wr_data;
+  logic        scratch_a_wr_en;
+  logic [13:0] scratch_a_wr_addr;
+  logic [255:0] scratch_a_wr_data;
+  logic        scratch_b_wr_en;
+  logic [13:0] scratch_b_wr_addr;
+  logic [255:0] scratch_b_wr_data;
+  logic        scratch_c_wr_en;
+  logic [13:0] scratch_c_wr_addr;
+  logic [255:0] scratch_c_wr_data;
+  logic signed [31:0] fusion_ma;
+  logic signed [31:0] fusion_mb;
+
+  function automatic logic is_fusion_stage(input logic [4:0] sid);
+    is_fusion_stage = (sid == 5'd0) || (sid == 5'd2) || (sid == 5'd4);
+  endfunction
+
+  function automatic logic [13:0] fusion_words_for_stage(input logic [4:0] sid);
+    case (sid)
+      5'd0: fusion_words_for_stage = P3_WORDS;
+      5'd2: fusion_words_for_stage = P4_WORDS;
+      default: fusion_words_for_stage = P5_WORDS;
+    endcase
+  endfunction
+
+  // Input source encoding: 0=P3, 1=P4, 2=P5, 3=A, 4=B, 5=C.
+  function automatic logic [2:0] source_sel_for_stage(input logic [4:0] sid);
+    case (sid)
+      5'd0,5'd2,5'd4: source_sel_for_stage = 3'd5;
+      5'd1,5'd5: source_sel_for_stage = 3'd0;
+      5'd3,5'd13: source_sel_for_stage = 3'd1;
+      5'd21: source_sel_for_stage = 3'd2;
+      5'd6,5'd8,5'd11,5'd12,5'd14,5'd16,5'd19,5'd20,
+      5'd22,5'd24,5'd27,5'd28: source_sel_for_stage = 3'd3;
+      5'd7,5'd9,5'd15,5'd17,5'd23,5'd25: source_sel_for_stage = 3'd4;
+      5'd10,5'd18,5'd26: source_sel_for_stage = 3'd5;
+      default: source_sel_for_stage = 3'd5;
+    endcase
+  endfunction
+
+  // POSTSWIN_ADDRCTRL_V1: stage-local configuration register bank.
+  // stage_prepare_req is the configuration boundary.  There is no per-token
+  // latency cost; non-fusion stage preparation intentionally takes one
+  // additional setup cycle so the registered configuration is guaranteed
+  // valid before streaming starts.
+  always_ff @(posedge clk or negedge rst_n) begin : STAGE_CFG_CAPTURE_V1
+    if (!rst_n) begin
+      cfg_stage_q      <= '0;
+      cfg_valid_q      <= 1'b0;
+      cfg_tokens_m1_q  <= '0;
+      cfg_w_out_q      <= '0;
+      cfg_w_in_q       <= '0;
+      cfg_h_in_q       <= '0;
+      cfg_kw_q         <= '0;
+      cfg_stride_q     <= '0;
+      cfg_pad_q        <= '0;
+      cfg_source_sel_q <= '0;
+    end else if (run_start) begin
+      cfg_valid_q <= 1'b0;
+    end else if (stage_prepare_req &&
+                 (!cfg_valid_q || (cfg_stage_q != stage_id))) begin
+      cfg_stage_q      <= stage_id;
+      cfg_valid_q      <= 1'b1;
+      cfg_tokens_m1_q  <= stage_tokens_m1(stage_id);
+      cfg_w_out_q      <= stage_w_out(stage_id);
+      cfg_w_in_q       <= stage_w_in(stage_id);
+      cfg_h_in_q       <= stage_h_in(stage_id);
+      cfg_kw_q         <= stage_kw(stage_id);
+      cfg_stride_q     <= stage_stride(stage_id);
+      cfg_pad_q        <= stage_pad(stage_id);
+      cfg_source_sel_q <= source_sel_for_stage(stage_id);
+    end
+  end
+
+  // Destination encoding: 0=P3, 1=P4, 2=P5, 3=A, 4=B, 5=C, 7=stream only.
+  function automatic logic [2:0] dest_sel_for_stage(input logic [4:0] sid);
+    case (sid)
+      5'd0: dest_sel_for_stage = 3'd0;
+      5'd2: dest_sel_for_stage = 3'd1;
+      5'd4: dest_sel_for_stage = 3'd2;
+      5'd1,5'd3,5'd5,5'd9,5'd13,5'd17,5'd21,5'd25:
+        dest_sel_for_stage = 3'd3;
+      5'd6,5'd8,5'd14,5'd16,5'd22,5'd24:
+        dest_sel_for_stage = 3'd4;
+      5'd7,5'd15,5'd23:
+        dest_sel_for_stage = 3'd5;
+      default: dest_sel_for_stage = 3'd7;
+    endcase
+  endfunction
+
+  // Exact divider-free row decoders for 12-bit token indices.
+  // 2521/2^15 = 1/13, with one additional shift for 26 and 52.
+
+  function automatic logic [6:0] div13_u12(input logic [11:0] n);
+    logic [23:0] wide;
+    begin
+      wide = ({12'b0,n} << 11) + ({12'b0,n} << 8) +
+             ({12'b0,n} << 7)  + ({12'b0,n} << 6) +
+             ({12'b0,n} << 4)  + ({12'b0,n} << 3) + {12'b0,n};
+      div13_u12 = wide >> 15;
+    end
+  endfunction
+
+  function automatic logic [6:0] div26_u12(input logic [11:0] n);
+    logic [23:0] wide;
+    begin
+      wide = ({12'b0,n} << 11) + ({12'b0,n} << 8) +
+             ({12'b0,n} << 7)  + ({12'b0,n} << 6) +
+             ({12'b0,n} << 4)  + ({12'b0,n} << 3) + {12'b0,n};
+      div26_u12 = wide >> 16;
+    end
+  endfunction
+
+  function automatic logic [6:0] div52_u12(input logic [11:0] n);
+    logic [23:0] wide;
+    begin
+      wide = ({12'b0,n} << 11) + ({12'b0,n} << 8) +
+             ({12'b0,n} << 7)  + ({12'b0,n} << 6) +
+             ({12'b0,n} << 4)  + ({12'b0,n} << 3) + {12'b0,n};
+      div52_u12 = wide >> 17;
+    end
+  endfunction
+
+  function automatic logic signed [39:0] mul_s8_u32_narrow(
+    input logic signed [7:0] x,
+    input logic [31:0] m
+  );
+    logic [7:0] mag;
+    logic [39:0] me;
+    logic [39:0] p0,p1,p2,p3,p4,p5,p6,p7;
+    logic [39:0] product_mag;
+    begin
+      mag = x[7] ? ((~$unsigned(x)) + 8'd1) : $unsigned(x);
+      me = {8'b0,m};
+      p0 = mag[0] ? (me << 0) : 40'b0;
+      p1 = mag[1] ? (me << 1) : 40'b0;
+      p2 = mag[2] ? (me << 2) : 40'b0;
+      p3 = mag[3] ? (me << 3) : 40'b0;
+      p4 = mag[4] ? (me << 4) : 40'b0;
+      p5 = mag[5] ? (me << 5) : 40'b0;
+      p6 = mag[6] ? (me << 6) : 40'b0;
+      p7 = mag[7] ? (me << 7) : 40'b0;
+      product_mag = ((p0+p1)+(p2+p3)) + ((p4+p5)+(p6+p7));
+      mul_s8_u32_narrow = x[7] ? -$signed(product_mag) : $signed(product_mag);
+    end
+  endfunction
+
+  function automatic logic signed [31:0] round_shift_away0_64(
+    input logic signed [63:0] x,
+    input int unsigned shift
+  );
+    logic signed [63:0] half;
+    logic signed [63:0] mag;
+    begin
+      if (shift == 0) begin
+        round_shift_away0_64 = x[31:0];
+      end else begin
+        half = 64'sd1 <<< (shift-1);
+        if (x >= 0)
+          round_shift_away0_64 = $signed((x + half) >>> shift);
+        else begin
+          mag = -x;
+          round_shift_away0_64 = -$signed((mag + half) >>> shift);
+        end
+      end
+    end
+  endfunction
+
+  function automatic logic signed [31:0] scale_s8_q30(
+    input logic signed [7:0] x,
+    input logic signed [31:0] m
+  );
+    logic signed [39:0] prod40;
+    logic signed [63:0] prod64;
+    begin
+      prod40 = mul_s8_u32_narrow(x, $unsigned(m));
+      prod64 = {{24{prod40[39]}},prod40};
+      scale_s8_q30 = round_shift_away0_64(prod64, FUSION_SHIFT);
+    end
+  endfunction
+
+  function automatic logic signed [7:0] sat_add_scaled(
+    input logic signed [7:0] a,
+    input logic signed [7:0] b,
+    input logic signed [31:0] ma,
+    input logic signed [31:0] mb
+  );
+    logic signed [31:0] sa;
+    logic signed [31:0] sb;
+    logic signed [32:0] sum;
+    begin
+      sa = scale_s8_q30(a, ma);
+      sb = scale_s8_q30(b, mb);
+      sum = $signed(sa) + $signed(sb);
+      if (sum > 33'sd127) sat_add_scaled = 8'sd127;
+      else if (sum < -33'sd128) sat_add_scaled = -8'sd128;
+      else sat_add_scaled = sum[7:0];
+    end
+  endfunction
+
+
+  // FUSIONPIPE_V1: exact second arithmetic segment.
+  function automatic logic signed [7:0] sat_add_products40(
+    input logic signed [39:0] pa,
+    input logic signed [39:0] pb
+  );
+    logic signed [63:0] pa64;
+    logic signed [63:0] pb64;
+    logic signed [31:0] sa;
+    logic signed [31:0] sb;
+    logic signed [32:0] sum;
+    begin
+      pa64 = {{24{pa[39]}},pa};
+      pb64 = {{24{pb[39]}},pb};
+
+      sa = round_shift_away0_64(pa64, FUSION_SHIFT);
+      sb = round_shift_away0_64(pb64, FUSION_SHIFT);
+
+      sum = $signed(sa) + $signed(sb);
+
+      if (sum > 33'sd127)
+        sat_add_products40 = 8'sd127;
+      else if (sum < -33'sd128)
+        sat_add_products40 = -8'sd128;
+      else
+        sat_add_products40 = sum[7:0];
+    end
+  endfunction
+
+  always_comb begin
+    unique case (fusion_kind_q)
+      2'd0: begin fusion_ma = TD_A_M; fusion_mb = TD_B_M; end
+      2'd1: begin fusion_ma = BU_A_M; fusion_mb = BU_B_M; end
+      default: begin fusion_ma = P5_A_M; fusion_mb = P5_B_M; end
+    endcase
+  end
+
+  // Pack output vectors and form word addresses.  Only 128-channel stages are
+  // stored; 4/1-channel predictions remain on the external output stream.
+  always_comb begin
+    stage_write_sel  = dest_sel_for_stage(out_stage_id);
+    stage_write_en   = out_valid && (stage_write_sel != 3'd7);
+    stage_write_addr = ($unsigned(out_token) << 2) + $unsigned(out_co_tile);
+    stage_write_data = '0;
+    for (int pack_lane=0; pack_lane<PE_N; pack_lane=pack_lane+1) begin
+      if (out_lane_mask[pack_lane])
+        stage_write_data[pack_lane*8 +: 8] = out_data[pack_lane];
+    end
+
+    fusion_write_en   = (fusion_state_q == F_WRITE);
+    fusion_write_addr = fusion_word_q;
+    fusion_write_data = fusion_result_q;
+    p5_write_addr     = ($unsigned(p5_proj_pixel) << 2) + $unsigned(p5_proj_co_tile);
+
+    p3_mem_wr_en   = stage_write_en && (stage_write_sel == 3'd0) &&
+                     (stage_write_addr < P3_WORDS);
+    p3_mem_wr_addr = stage_write_addr;
+    p3_mem_wr_data = stage_write_data;
+
+    p4_mem_wr_en   = stage_write_en && (stage_write_sel == 3'd1) &&
+                     (stage_write_addr < P4_WORDS);
+    p4_mem_wr_addr = stage_write_addr;
+    p4_mem_wr_data = stage_write_data;
+
+    scratch_a_wr_en   = stage_write_en && (stage_write_sel == 3'd3) &&
+                        (stage_write_addr < MAX_WORDS);
+    scratch_a_wr_addr = stage_write_addr;
+    scratch_a_wr_data = stage_write_data;
+
+    scratch_b_wr_en   = stage_write_en && (stage_write_sel == 3'd4) &&
+                        (stage_write_addr < MAX_WORDS);
+    scratch_b_wr_addr = stage_write_addr;
+    scratch_b_wr_data = stage_write_data;
+
+    // P5 has two phase-exclusive producers. Mux before the RAM so the array
+    // itself has exactly one write enable/address/data tuple.
+    p5_mem_wr_en   = 1'b0;
+    p5_mem_wr_addr = '0;
+    p5_mem_wr_data = '0;
+    if (stage_write_en && (stage_write_sel == 3'd2)) begin
+      p5_mem_wr_en   = (stage_write_addr < P5_WORDS);
+      p5_mem_wr_addr = stage_write_addr;
+      p5_mem_wr_data = stage_write_data;
+    end else if (p5_proj_valid) begin
+      p5_mem_wr_en   = (p5_write_addr < P5_WORDS);
+      p5_mem_wr_addr = p5_write_addr;
+      p5_mem_wr_data = p5_proj_data;
+    end
+
+    // Scratch-C likewise gets exactly one physical write tuple.
+    scratch_c_wr_en   = 1'b0;
+    scratch_c_wr_addr = '0;
+    scratch_c_wr_data = '0;
+    if (stage_write_en && (stage_write_sel == 3'd5)) begin
+      scratch_c_wr_en   = (stage_write_addr < MAX_WORDS);
+      scratch_c_wr_addr = stage_write_addr;
+      scratch_c_wr_data = stage_write_data;
+    end else if (fusion_write_en) begin
+      scratch_c_wr_en   = (fusion_write_addr < MAX_WORDS);
+      scratch_c_wr_addr = fusion_write_addr;
+      scratch_c_wr_data = fusion_write_data;
+    end
+  end
+
+  // Every activation memory has exactly one synchronous read port. P5 and
+  // scratch-A are shared with fusion; the other banks serve only MAC prefetch.
+
+  // ==========================================================================
+  // ADDRPIPE2_V1_IMPLEMENTED
+  //
+  // Three-cycle activation look-ahead:
+  //   request -> Stage A FF -> Stage B FF -> synchronous RAM/URAM read
+  //
+  // Stage A: token -> oy/ox/ky/kx/cit
+  // Stage B: iy/ix -> bounds -> linear address -> local one-hot bank select
+  //
+  // Address and token/CI metadata advance under the SAME valid pipeline.
+  // ==========================================================================
+
+  logic        ap2_feed_valid;
+  logic [11:0] ap2_feed_token;
+  logic [5:0]  ap2_feed_ci;
+  logic [2:0]  ap2_feed_source;
+
+  // AP2_XY_COUNTER_V1_IMPLEMENTED
+  // Running raster coordinates remove token / 52, /26, /13 decode
+  // from the Stage-A timing path without adding a pipeline stage.
+  (* max_fanout = 8 *) logic [6:0] ap2_feed_ox_q;
+  (* max_fanout = 8 *) logic [6:0] ap2_feed_oy_q;
+
+
+  logic [6:0]  ap2_a_oy_d;
+  logic [6:0]  ap2_a_ox_d;
+  logic [1:0]  ap2_a_ky_d;
+  logic [1:0]  ap2_a_kx_d;
+  logic [1:0]  ap2_a_cit_d;
+  logic [3:0]  ap2_a_kernel_group_d;
+  logic [11:0] ap2_a_row_base_d;
+
+  logic        ap2_a_valid_q;
+  logic [11:0] ap2_a_token_q;
+  logic [5:0]  ap2_a_ci_q;
+  logic [6:0]  ap2_a_oy_q;
+  logic [6:0]  ap2_a_ox_q;
+  logic [1:0]  ap2_a_ky_q;
+  logic [1:0]  ap2_a_kx_q;
+  logic [1:0]  ap2_a_cit_q;
+
+  // Snapshot all Stage-B configuration with Stage-A metadata.
+  logic [6:0]  ap2_a_h_in_q;
+  logic [6:0]  ap2_a_w_in_q;
+  logic [1:0]  ap2_a_stride_q;
+  logic [1:0]  ap2_a_pad_q;
+  logic [2:0]  ap2_a_source_q;
+
+  logic signed [7:0] ap2_b_iy_d;
+  logic signed [7:0] ap2_b_ix_d;
+  logic [13:0] ap2_b_iy_ext_d;
+  logic [13:0] ap2_b_ix_ext_d;
+  logic [13:0] ap2_b_addr_d;
+  logic        ap2_b_in_bounds_d;
+  logic        ap2_b_range_ok_d;
+  logic [5:0]  ap2_b_bank_oh_d;
+
+  logic        ap2_b_slot_valid_q;
+  logic        ap2_b_in_bounds_q;
+  logic        ap2_b_mem_access_q;
+  logic [13:0] ap2_b_addr_q;
+  logic [5:0]  ap2_b_bank_oh_q;
+  logic [2:0]  ap2_b_source_q;
+  logic [11:0] ap2_b_token_q;
+  logic [5:0]  ap2_b_ci_q;
+
+  // Tag corresponding to the synchronous memory output presented to the MAC.
+  logic        ap2_mem_slot_valid_q;
+  logic [11:0] ap2_mem_token_q;
+  logic [5:0]  ap2_mem_ci_q;
+
+  always_comb begin : POSTMEM_READ_ARBITRATION_V3
+    p3_mem_rd_en          = 1'b0;
+    p3_mem_rd_addr        = '0;
+    p4_mem_rd_en          = 1'b0;
+    p4_mem_rd_addr        = '0;
+    p5_mem_rd_en          = 1'b0;
+    p5_mem_rd_addr        = '0;
+    scratch_a_mem_rd_en   = 1'b0;
+    scratch_a_mem_rd_addr = '0;
+    scratch_b_mem_rd_en   = 1'b0;
+    scratch_b_mem_rd_addr = '0;
+    scratch_c_mem_rd_en   = 1'b0;
+    scratch_c_mem_rd_addr = '0;
+
+    if (fusion_state_q == F_PRIME) begin
+      if (fusion_word_q < P5_WORDS) begin
+        p5_mem_rd_en   = 1'b1;
+        p5_mem_rd_addr = fusion_word_q;
+      end
+      if (fusion_word_q < MAX_WORDS) begin
+        scratch_a_mem_rd_en   = 1'b1;
+        scratch_a_mem_rd_addr = fusion_word_q;
+      end
+      end else if (!fusion_busy &&
+                     ap2_b_slot_valid_q &&
+                     ap2_b_mem_access_q) begin
+
+        // ADDRPIPE2_V1: registered local one-hot memory control.
+        // No token/address arithmetic remains on this URAM-enable path.
+        if (ap2_b_bank_oh_q[0]) begin
+          p3_mem_rd_en   = 1'b1;
+          p3_mem_rd_addr = ap2_b_addr_q;
+        end
+
+        if (ap2_b_bank_oh_q[1]) begin
+          p4_mem_rd_en   = 1'b1;
+          p4_mem_rd_addr = ap2_b_addr_q;
+        end
+
+        if (ap2_b_bank_oh_q[2]) begin
+          p5_mem_rd_en   = 1'b1;
+          p5_mem_rd_addr = ap2_b_addr_q;
+        end
+
+        if (ap2_b_bank_oh_q[3]) begin
+          scratch_a_mem_rd_en   = 1'b1;
+          scratch_a_mem_rd_addr = ap2_b_addr_q;
+        end
+
+        if (ap2_b_bank_oh_q[4]) begin
+          scratch_b_mem_rd_en   = 1'b1;
+          scratch_b_mem_rd_addr = ap2_b_addr_q;
+        end
+
+        if (ap2_b_bank_oh_q[5]) begin
+          scratch_c_mem_rd_en   = 1'b1;
+          scratch_c_mem_rd_addr = ap2_b_addr_q;
+        end
+      end
+  end
+
+
+  // ==========================================================
+  // Z81 timing-first 10816x256 memories.
+  // P4/P5 BRAM memories remain unchanged.
+  // ==========================================================
+
+  swin_sdp_hybrid_10816x256_z81 u_z81_p3_fpn_mem (
+      .clk     (clk),
+      .wr_en   (p3_mem_wr_en),
+      .wr_addr (p3_mem_wr_addr),
+      .wr_data (p3_mem_wr_data),
+      .rd_en   (p3_mem_rd_en),
+      .rd_addr (p3_mem_rd_addr),
+      .rd_data (p3_mem_rd_q)
+  );
+
+  swin_sdp_hybrid_10816x256_z81 u_z81_scratch_a (
+      .clk     (clk),
+      .wr_en   (scratch_a_wr_en),
+      .wr_addr (scratch_a_wr_addr),
+      .wr_data (scratch_a_wr_data),
+      .rd_en   (scratch_a_mem_rd_en),
+      .rd_addr (scratch_a_mem_rd_addr),
+      .rd_data (scratch_a_mem_rd_q)
+  );
+
+  swin_sdp_hybrid_10816x256_z81 u_z81_scratch_b (
+      .clk     (clk),
+      .wr_en   (scratch_b_wr_en),
+      .wr_addr (scratch_b_wr_addr),
+      .wr_data (scratch_b_wr_data),
+      .rd_en   (scratch_b_mem_rd_en),
+      .rd_addr (scratch_b_mem_rd_addr),
+      .rd_data (scratch_b_mem_rd_q)
+  );
+
+  swin_sdp_hybrid_10816x256_z81 u_z81_scratch_c (
+      .clk     (clk),
+      .wr_en   (scratch_c_wr_en),
+      .wr_addr (scratch_c_wr_addr),
+      .wr_data (scratch_c_wr_data),
+      .rd_en   (scratch_c_mem_rd_en),
+      .rd_addr (scratch_c_mem_rd_addr),
+      .rd_data (scratch_c_mem_rd_q)
+  );
+
+  // No memory reset loops: only their registered outputs are selected after
+  // the read edge. This is the native synchronous BRAM/URAM inference pattern.
+  always_ff @(posedge clk) begin
+    if (p4_mem_wr_en)
+      p4_fpn_mem[p4_mem_wr_addr] <= p4_mem_wr_data;
+    if (p4_mem_rd_en)
+      p4_mem_rd_q <= p4_fpn_mem[p4_mem_rd_addr];
+
+    if (p5_mem_wr_en)
+      p5_fpn_mem[p5_mem_wr_addr] <= p5_mem_wr_data;
+    if (p5_mem_rd_en)
+      p5_mem_rd_q <= p5_fpn_mem[p5_mem_rd_addr];
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) begin
+    if (p5_proj_valid && stage_write_en && (stage_write_sel == 3'd2))
+      $fatal(1,"post_swin_adapter: simultaneous P5 projection/stage writes");
+    if (fusion_write_en && stage_write_en && (stage_write_sel == 3'd5))
+      $fatal(1,"post_swin_adapter: simultaneous scratch-C stage/fusion writes");
+    if (!$onehot0({p3_mem_rd_en,p4_mem_rd_en,p5_mem_rd_en,
+                   scratch_a_mem_rd_en,scratch_b_mem_rd_en,
+                   scratch_c_mem_rd_en}) && (fusion_state_q != F_PRIME)) begin
+      $fatal(1,"post_swin_adapter: multiple MAC prefetch memories selected");
+    end
+  end
+`endif
+
+  // P5 source accounting is independently reset for each inference.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      p5_capture_count <= '0;
+    end else if (run_start) begin
+      p5_capture_count <= '0;
+    end else if (p5_proj_valid) begin
+      p5_capture_count <= p5_capture_count + 1'b1;
+    end
+  end
+
+  // --------------------------------------------------------------------------
+  // ==========================================================================
+  // ADDRPIPE2_V1: latency-balanced three-cycle activation prefetch.
+  //
+  // Last three weight-load slots prime token 0/1/2. During S_STREAM the
+  // adapter schedules token N+3 while the MAC consumes token N.
+  // ==========================================================================
+
+  always_comb begin : ADDRPIPE2_FEED
+    ap2_feed_valid  = 1'b0;
+    ap2_feed_token  = 12'd0;
+    ap2_feed_ci     = adapter_ci_tile[5:0];
+    ap2_feed_source = cfg_source_sel_q;
+
+    if (cfg_valid_q) begin
+
+      // Prime token 0 during weight row 29.
+      if (adapter_weight_row_load &&
+          (adapter_weight_row_index == 5'd29)) begin
+        ap2_feed_valid = 1'b1;
+        ap2_feed_token = 12'd0;
+      end
+
+      // Prime token 1 only when it exists.
+      else if (adapter_weight_row_load &&
+               (adapter_weight_row_index == 5'd30) &&
+               (cfg_tokens_m1_q >= 12'd1)) begin
+        ap2_feed_valid = 1'b1;
+        ap2_feed_token = 12'd1;
+      end
+
+      // Prime token 2 only when it exists.
+      else if (adapter_weight_row_load &&
+               (adapter_weight_row_index == 5'd31) &&
+               (cfg_tokens_m1_q >= 12'd2)) begin
+        ap2_feed_valid = 1'b1;
+        ap2_feed_token = 12'd2;
+      end
+
+      // Steady state: total request-to-memory-output latency is three clocks.
+      else if (adapter_stream_valid &&
+               (($unsigned(adapter_token) + 12'd3) <= cfg_tokens_m1_q)) begin
+        ap2_feed_valid = 1'b1;
+        ap2_feed_token = $unsigned(adapter_token) + 12'd3;
+      end
+    end
+  end
+
+
+  // --------------------------------------------------------------------------
+  // Stage A combinational: output-space decode only.
+  // --------------------------------------------------------------------------
+
+
+  // AP2_XY_COUNTER_V1:
+  // ap2_feed_token is issued in raster order:
+  //   0,1,2 during prefill, then N+3 during stream.
+  // Therefore X/Y can be advanced incrementally instead of decoded
+  // through reciprocal-divider/carry chains.
+  always_ff @(posedge clk or negedge rst_n) begin : AP2_XY_COUNTER_V1
+    if (!rst_n) begin
+      ap2_feed_ox_q <= 7'd0;
+      ap2_feed_oy_q <= 7'd0;
+    end else if (run_start) begin
+      ap2_feed_ox_q <= 7'd0;
+      ap2_feed_oy_q <= 7'd0;
+    end else if (ap2_feed_valid) begin
+
+      if (ap2_feed_token == 12'd0) begin
+        // Token 0 itself uses coordinate (0,0).
+        // Prepare state for token 1.
+        if (cfg_w_out_q == 7'd1) begin
+          ap2_feed_ox_q <= 7'd0;
+          ap2_feed_oy_q <= 7'd1;
+        end else begin
+          ap2_feed_ox_q <= 7'd1;
+          ap2_feed_oy_q <= 7'd0;
+        end
+
+      end else if (ap2_feed_ox_q == (cfg_w_out_q - 1'b1)) begin
+        ap2_feed_ox_q <= 7'd0;
+        ap2_feed_oy_q <= ap2_feed_oy_q + 1'b1;
+
+      end else begin
+        ap2_feed_ox_q <= ap2_feed_ox_q + 1'b1;
+      end
+    end
+  end
+
+  always_comb begin : ADDRPIPE2_STAGE_A_COMB
+    ap2_a_oy_d           = '0;
+    ap2_a_ox_d           = '0;
+    ap2_a_ky_d           = '0;
+    ap2_a_kx_d           = '0;
+    ap2_a_cit_d          = ap2_feed_ci[1:0];
+    ap2_a_kernel_group_d = '0;
+    ap2_a_row_base_d     = '0;
+
+    if (ap2_feed_valid) begin
+
+        // AP2_XY_COUNTER_V1:
+        // Coordinate for token 0 is explicitly (0,0).
+        // Subsequent requests consume the running raster counters.
+        if (ap2_feed_token == 12'd0) begin
+          ap2_a_oy_d = 7'd0;
+          ap2_a_ox_d = 7'd0;
+        end else begin
+          ap2_a_oy_d = ap2_feed_oy_q;
+          ap2_a_ox_d = ap2_feed_ox_q;
+        end
+
+        if (cfg_kw_q == 2'd1) begin
+        ap2_a_ky_d = 2'd0;
+        ap2_a_kx_d = 2'd0;
+      end else begin
+        ap2_a_kernel_group_d = ap2_feed_ci[5:2];
+
+        if (ap2_a_kernel_group_d < 4'd3) begin
+          ap2_a_ky_d = 2'd0;
+          ap2_a_kx_d = ap2_a_kernel_group_d[1:0];
+        end
+        else if (ap2_a_kernel_group_d < 4'd6) begin
+          ap2_a_ky_d = 2'd1;
+          ap2_a_kx_d = ap2_a_kernel_group_d - 4'd3;
+        end
+        else begin
+          ap2_a_ky_d = 2'd2;
+          ap2_a_kx_d = ap2_a_kernel_group_d - 4'd6;
+        end
+      end
+    end
+  end
+
+
+  // Stage-A address and metadata are one indivisible pipeline transaction.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      ap2_a_valid_q  <= 1'b0;
+      ap2_a_token_q  <= '0;
+      ap2_a_ci_q     <= '0;
+      ap2_a_oy_q     <= '0;
+      ap2_a_ox_q     <= '0;
+      ap2_a_ky_q     <= '0;
+      ap2_a_kx_q     <= '0;
+      ap2_a_cit_q    <= '0;
+      ap2_a_h_in_q   <= '0;
+      ap2_a_w_in_q   <= '0;
+      ap2_a_stride_q <= '0;
+      ap2_a_pad_q    <= '0;
+      ap2_a_source_q <= '0;
+    end else begin
+      ap2_a_valid_q <= ap2_feed_valid;
+
+      if (ap2_feed_valid) begin
+        ap2_a_token_q  <= ap2_feed_token;
+        ap2_a_ci_q     <= ap2_feed_ci;
+        ap2_a_oy_q     <= ap2_a_oy_d;
+        ap2_a_ox_q     <= ap2_a_ox_d;
+        ap2_a_ky_q     <= ap2_a_ky_d;
+        ap2_a_kx_q     <= ap2_a_kx_d;
+        ap2_a_cit_q    <= ap2_a_cit_d;
+
+        // Configuration is snapshotted with the same transaction.
+        ap2_a_h_in_q   <= cfg_h_in_q;
+        ap2_a_w_in_q   <= cfg_w_in_q;
+        ap2_a_stride_q <= cfg_stride_q;
+        ap2_a_pad_q    <= cfg_pad_q;
+        ap2_a_source_q <= ap2_feed_source;
+      end
+    end
+  end
+
+
+  // --------------------------------------------------------------------------
+  // Stage B combinational: input-space coordinates, bounds and linear address.
+  // --------------------------------------------------------------------------
+
+  always_comb begin : ADDRPIPE2_STAGE_B_COMB
+    ap2_b_iy_d        = '0;
+    ap2_b_ix_d        = '0;
+    ap2_b_iy_ext_d    = '0;
+    ap2_b_ix_ext_d    = '0;
+    ap2_b_addr_d      = '0;
+    ap2_b_in_bounds_d = 1'b0;
+    ap2_b_range_ok_d  = 1'b0;
+    ap2_b_bank_oh_d   = 6'b0;
+
+    unique case (ap2_a_source_q)
+      3'd0: ap2_b_bank_oh_d = 6'b000001;
+      3'd1: ap2_b_bank_oh_d = 6'b000010;
+      3'd2: ap2_b_bank_oh_d = 6'b000100;
+      3'd3: ap2_b_bank_oh_d = 6'b001000;
+      3'd4: ap2_b_bank_oh_d = 6'b010000;
+      default: ap2_b_bank_oh_d = 6'b100000;
+    endcase
+
+    if (ap2_a_valid_q) begin
+
+      // Signed arithmetic is mandatory: padding can produce -1.
+      if (ap2_a_stride_q == 2'd2) begin
+        ap2_b_iy_d =
+          ($signed({1'b0,ap2_a_oy_q}) <<< 1) +
+          $signed({6'b0,ap2_a_ky_q}) -
+          $signed({6'b0,ap2_a_pad_q});
+
+        ap2_b_ix_d =
+          ($signed({1'b0,ap2_a_ox_q}) <<< 1) +
+          $signed({6'b0,ap2_a_kx_q}) -
+          $signed({6'b0,ap2_a_pad_q});
+      end else begin
+        ap2_b_iy_d =
+          $signed({1'b0,ap2_a_oy_q}) +
+          $signed({6'b0,ap2_a_ky_q}) -
+          $signed({6'b0,ap2_a_pad_q});
+
+        ap2_b_ix_d =
+          $signed({1'b0,ap2_a_ox_q}) +
+          $signed({6'b0,ap2_a_kx_q}) -
+          $signed({6'b0,ap2_a_pad_q});
+      end
+
+      ap2_b_in_bounds_d =
+        (ap2_b_iy_d >= 8'sd0) &&
+        (ap2_b_ix_d >= 8'sd0) &&
+        ($unsigned(ap2_b_iy_d) < ap2_a_h_in_q) &&
+        ($unsigned(ap2_b_ix_d) < ap2_a_w_in_q);
+
+      if (ap2_b_in_bounds_d) begin
+        ap2_b_iy_ext_d = {6'b0,$unsigned(ap2_b_iy_d)};
+        ap2_b_ix_ext_d = {6'b0,$unsigned(ap2_b_ix_d)};
+
+        if (ap2_a_w_in_q == 7'd52)
+          ap2_b_addr_d =
+            ((((ap2_b_iy_ext_d << 5) +
+               (ap2_b_iy_ext_d << 4) +
+               (ap2_b_iy_ext_d << 2)) +
+               ap2_b_ix_ext_d) << 2) +
+            {{12{1'b0}},ap2_a_cit_q};
+
+        else if (ap2_a_w_in_q == 7'd26)
+          ap2_b_addr_d =
+            ((((ap2_b_iy_ext_d << 4) +
+               (ap2_b_iy_ext_d << 3) +
+               (ap2_b_iy_ext_d << 1)) +
+               ap2_b_ix_ext_d) << 2) +
+            {{12{1'b0}},ap2_a_cit_q};
+
+        else
+          ap2_b_addr_d =
+            ((((ap2_b_iy_ext_d << 3) +
+               (ap2_b_iy_ext_d << 2) +
+               ap2_b_iy_ext_d) +
+               ap2_b_ix_ext_d) << 2) +
+            {{12{1'b0}},ap2_a_cit_q};
+
+        // Perform range checking BEFORE the Stage-B register. It therefore
+        // does not remain on the final Stage-B-FF -> URAM enable path.
+        unique case (ap2_a_source_q)
+          3'd0: ap2_b_range_ok_d = (ap2_b_addr_d < P3_WORDS);
+          3'd1: ap2_b_range_ok_d = (ap2_b_addr_d < P4_WORDS);
+          3'd2: ap2_b_range_ok_d = (ap2_b_addr_d < P5_WORDS);
+          default:
+            ap2_b_range_ok_d = (ap2_b_addr_d < MAX_WORDS);
+        endcase
+      end
+    end
+  end
+
+
+  // Stage-B address and tags remain in one shared valid pipeline.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      ap2_b_slot_valid_q <= 1'b0;
+      ap2_b_in_bounds_q  <= 1'b0;
+      ap2_b_mem_access_q <= 1'b0;
+      ap2_b_addr_q       <= '0;
+      ap2_b_bank_oh_q    <= '0;
+      ap2_b_source_q     <= '0;
+      ap2_b_token_q      <= '0;
+      ap2_b_ci_q         <= '0;
+    end else begin
+      ap2_b_slot_valid_q <= ap2_a_valid_q;
+
+      if (ap2_a_valid_q) begin
+        ap2_b_in_bounds_q  <= ap2_b_in_bounds_d;
+        ap2_b_mem_access_q <=
+          ap2_b_in_bounds_d && ap2_b_range_ok_d;
+
+        ap2_b_addr_q    <= ap2_b_addr_d;
+        ap2_b_bank_oh_q <= ap2_b_bank_oh_d;
+        ap2_b_source_q  <= ap2_a_source_q;
+        ap2_b_token_q   <= ap2_a_token_q;
+        ap2_b_ci_q      <= ap2_a_ci_q;
+      end else begin
+        ap2_b_in_bounds_q  <= 1'b0;
+        ap2_b_mem_access_q <= 1'b0;
+      end
+    end
+  end
+
+
+  // Preserve the old external/internal names where other adapter logic uses
+  // them, but they now come only from registered Stage-B state.
+  always_comb begin : ADDRPIPE2_OUTPUT_MAP
+    input_source_sel     = ap2_b_source_q;
+    input_prefetch_valid =
+      ap2_b_slot_valid_q && ap2_b_mem_access_q;
+    input_prefetch_addr  = ap2_b_addr_q;
+  end
+
+
+  // --------------------------------------------------------------------------
+  // ADDRPIPE2_V1 synchronous memory-output metadata.
+  //
+  // slot_valid and in-bounds/memory-access are deliberately separate:
+  //   slot_valid=1, mem_access=0 means a correctly scheduled padded zero.
+  // --------------------------------------------------------------------------
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      input_source_sel_q     <= '0;
+      input_prefetch_valid_q <= 1'b0;
+
+      ap2_mem_slot_valid_q   <= 1'b0;
+      ap2_mem_token_q        <= '0;
+      ap2_mem_ci_q           <= '0;
+
+    end else begin
+      input_source_sel_q <= ap2_b_source_q;
+
+      // This valid means an actual physical memory read was issued.
+      input_prefetch_valid_q <=
+        (!fusion_busy &&
+         ap2_b_slot_valid_q &&
+         ap2_b_mem_access_q);
+
+      // This tag means a logical activation slot was scheduled, including
+      // zero-padding positions which deliberately perform no memory read.
+      ap2_mem_slot_valid_q <=
+        (!fusion_busy && ap2_b_slot_valid_q);
+
+      ap2_mem_token_q <= ap2_b_token_q;
+      ap2_mem_ci_q    <= ap2_b_ci_q;
+    end
+  end
+
+
+`ifndef SYNTHESIS
+  // --------------------------------------------------------------------------
+  // ADDRPIPE2_V1 correctness fence.
+  //
+  // The MAC is free-running during S_STREAM. Therefore the registered
+  // activation presented in that cycle MUST carry the same token and CI tag.
+  // --------------------------------------------------------------------------
+  always_ff @(posedge clk) begin
+    if (rst_n &&
+        cfg_valid_q &&
+        adapter_stream_valid &&
+        !fusion_busy) begin
+
+      if (!ap2_mem_slot_valid_q)
+        $fatal(1,
+          "ADDRPIPE2 missing prefetched activation token=%0d ci=%0d",
+          adapter_token, adapter_ci_tile);
+
+      if (ap2_mem_token_q !== $unsigned(adapter_token))
+        $fatal(1,
+          "ADDRPIPE2 token mismatch expected=%0d got=%0d ci=%0d",
+          adapter_token, ap2_mem_token_q, adapter_ci_tile);
+
+      if (ap2_mem_ci_q !== adapter_ci_tile[5:0])
+        $fatal(1,
+          "ADDRPIPE2 CI mismatch token=%0d expected_ci=%0d got_ci=%0d",
+          adapter_token, adapter_ci_tile, ap2_mem_ci_q);
+    end
+  end
+`endif
+
+
+  // Mux only registered RAM outputs; never mux indexed array reads.
+  always_comb begin
+    input_word_selected = '0;
+    if (input_prefetch_valid_q) begin
+      unique case (input_source_sel_q)
+        3'd0: input_word_selected = p3_mem_rd_q;
+        3'd1: input_word_selected = p4_mem_rd_q;
+        3'd2: input_word_selected = p5_mem_rd_q;
+        3'd3: input_word_selected = scratch_a_mem_rd_q;
+        3'd4: input_word_selected = scratch_b_mem_rd_q;
+        default: input_word_selected = scratch_c_mem_rd_q;
+      endcase
+    end
+  end
+
+  always_comb begin
+    for (int in_lane=0; in_lane<PE_K; in_lane=in_lane+1)
+      adapter_input_vector[in_lane] =
+        {input_word_selected[in_lane*8+7], input_word_selected[in_lane*8 +: 8]};
+  end
+
+  // --------------------------------------------------------------------------
+  // Combinational request interface to the existing final P3/P4 memories.
+  // --------------------------------------------------------------------------
+  always_comb begin : FUSION_READ_CONTROL
+    integer tensor_token;
+    integer y52;
+    integer x52;
+    integer upsample_p4_token;
+    integer tile32;
+    integer half16;
+
+    p3_src_rd_en      = 1'b0;
+    p3_src_rd_pixel   = '0;
+    p3_src_rd_co_tile = '0;
+    p4_src_rd_en      = 1'b0;
+    p4_src_rd_pixel   = '0;
+    p4_src_rd_co_tile = '0;
+
+    tensor_token = $unsigned(fusion_word_q) >> 2;
+    tile32       = $unsigned(fusion_word_q) & 3;
+    half16       = ((fusion_state_q == F_EXT_HI_WAIT) ||
+                    (fusion_state_q == F_EXT_HI)) ? 1 : 0;
+      // FUSION_P4_COUNTER_V1:
+      // Exact P4 nearest-neighbour pixel is maintained incrementally.
+      upsample_p4_token = $unsigned(fusion_p4_token_q);
+
+    if ((fusion_state_q == F_EXT_LO) ||
+        (fusion_state_q == F_EXT_HI_WAIT) ||
+        (fusion_state_q == F_EXT_HI)) begin
+      if (fusion_kind_q == 2'd0) begin
+        p3_src_rd_en      = 1'b1;
+        p3_src_rd_pixel   = tensor_token[11:0];
+        p3_src_rd_co_tile = ((tile32<<1) + half16);
+        p4_src_rd_en      = 1'b1;
+        p4_src_rd_pixel   = upsample_p4_token[9:0];
+        p4_src_rd_co_tile = ((tile32<<1) + half16);
+      end else if (fusion_kind_q == 2'd1) begin
+        p4_src_rd_en      = 1'b1;
+        p4_src_rd_pixel   = tensor_token[9:0];
+        p4_src_rd_co_tile = ((tile32<<1) + half16);
+      end
+    end
+  end
+
+  assign fusion_busy       = (fusion_state_q != F_IDLE);
+  assign fusion_kind       = fusion_kind_q;
+  assign fusion_word_index = fusion_word_q;
+
+  // Non-fusion stages are ready immediately; fusion stages become ready only
+  // after their complete input tensor has been materialized in scratch C.
+  assign tensor_prepare_done = stage_prepare_req &&
+    cfg_valid_q && (cfg_stage_q == stage_id) &&
+    (!is_fusion_stage(stage_id) ||
+     (prepared_valid_q && (prepared_stage_q == stage_id)));
+
+
+  // --------------------------------------------------------------------------
+  // FUSION_P4_COUNTER_V1
+  //
+  // fusion_word_q contains four 32-channel words per spatial token.
+  // Advance the spatial coordinate only after word 3 is written.
+  //
+  // Source mapping:
+  //   52x52 x : 0 1 2 3 ... 50 51
+  //   26x26 x : 0 0 1 1 ... 25 25
+  //
+  // Counter changes occur on the existing F_WRITE edge, therefore
+  // fusion latency and cycle count are unchanged.
+  // --------------------------------------------------------------------------
+  always_ff @(posedge clk or negedge rst_n) begin : FUSION_P4_COUNTER_V1
+    if (!rst_n) begin
+      fusion_x52_q      <= 6'd0;
+      fusion_y52_odd_q  <= 1'b0;
+      fusion_p4_token_q <= 10'd0;
+
+    end else if (run_start) begin
+      fusion_x52_q      <= 6'd0;
+      fusion_y52_odd_q  <= 1'b0;
+      fusion_p4_token_q <= 10'd0;
+
+    end else if ((fusion_state_q == F_IDLE) &&
+                 stage_prepare_req &&
+                 is_fusion_stage(stage_id) &&
+                 (!prepared_valid_q ||
+                  (prepared_stage_q != stage_id))) begin
+
+      // A new fusion tensor always starts at source pixel (0,0).
+      fusion_x52_q      <= 6'd0;
+      fusion_y52_odd_q  <= 1'b0;
+      fusion_p4_token_q <= 10'd0;
+
+    end else if ((fusion_state_q == F_WRITE) &&
+                 (fusion_kind_q == 2'd0) &&
+                 (fusion_word_q[1:0] == 2'b11)) begin
+
+      // Completed one 128-channel spatial location.
+      if (fusion_x52_q == 6'd51) begin
+        fusion_x52_q <= 6'd0;
+
+        if (!fusion_y52_odd_q) begin
+          // End of even source row:
+          // next odd source row maps to the SAME P4 row.
+          //
+          // current address = row_base + 25
+          // next address    = row_base
+          fusion_y52_odd_q  <= 1'b1;
+          fusion_p4_token_q <= fusion_p4_token_q - 10'd25;
+
+        end else begin
+          // End of odd source row:
+          // move to the next P4 row.
+          //
+          // current address = row_base + 25
+          // next address    = row_base + 26
+          fusion_y52_odd_q  <= 1'b0;
+          fusion_p4_token_q <= fusion_p4_token_q + 10'd1;
+        end
+
+      end else begin
+        fusion_x52_q <= fusion_x52_q + 1'b1;
+
+        // Increment P4 x after every odd 52x52 source x.
+        if (fusion_x52_q[0])
+          fusion_p4_token_q <= fusion_p4_token_q + 10'd1;
+      end
+    end
+  end
+
+
+  // --------------------------------------------------------------------------
+  // Fusion sequencer.
+  // --------------------------------------------------------------------------
+  always_ff @(posedge clk or negedge rst_n) begin : FUSION_SEQUENCER
+    if (!rst_n) begin
+      fusion_state_q   <= F_IDLE;
+      fusion_kind_q    <= '0;
+      fusion_word_q    <= '0;
+      fusion_group_q   <= '0;
+      fusion_src_a_q   <= '0;
+      fusion_src_b_q   <= '0;
+      fusion_result_q  <= '0;
+      prepared_stage_q <= '0;
+      prepared_valid_q <= 1'b0;
+      graph_error      <= 1'b0;
+    end else begin
+      if (run_start) begin
+        fusion_state_q   <= F_IDLE;
+        prepared_stage_q <= '0;
+        prepared_valid_q <= 1'b0;
+        graph_error      <= 1'b0;
+      end else begin
+        unique case (fusion_state_q)
+          F_IDLE: begin
+            if (stage_prepare_req && is_fusion_stage(stage_id) &&
+                (!prepared_valid_q || (prepared_stage_q != stage_id))) begin
+              fusion_kind_q   <= (stage_id == 5'd0) ? 2'd0 :
+                                 (stage_id == 5'd2) ? 2'd1 : 2'd2;
+              fusion_word_q   <= '0;
+              fusion_group_q  <= '0;
+              fusion_src_a_q  <= '0;
+              fusion_src_b_q  <= '0;
+              fusion_result_q <= '0;
+              fusion_state_q  <= F_PRIME;
+            end
+          end
+
+          F_PRIME: begin
+            fusion_src_a_q  <= '0;
+            fusion_src_b_q  <= '0;
+            fusion_result_q <= '0;
+            fusion_mul_valid_q <= 1'b0;
+            fusion_mul_group_q <= '0;
+            fusion_group_q  <= '0;
+            fusion_state_q  <= F_INTERNAL_CAPTURE;
+          end
+
+          F_INTERNAL_CAPTURE: begin
+            if (fusion_kind_q == 2'd1) begin
+              fusion_src_b_q <= scratch_a_mem_rd_q;
+              fusion_state_q <= F_EXT_LO;
+            end else if (fusion_kind_q == 2'd2) begin
+              fusion_src_a_q <= p5_mem_rd_q;
+              fusion_src_b_q <= scratch_a_mem_rd_q;
+              fusion_state_q <= F_CALC;
+            end else begin
+              fusion_state_q <= F_EXT_LO;
+            end
+          end
+
+          F_EXT_LO: begin
+            if ((fusion_kind_q == 2'd0) && p3_src_rd_valid && p4_src_rd_valid) begin
+              fusion_src_a_q[127:0] <= p3_src_rd_data;
+              fusion_src_b_q[127:0] <= p4_src_rd_data;
+              fusion_state_q <= F_EXT_HI_WAIT;
+            end else if ((fusion_kind_q == 2'd1) && p4_src_rd_valid) begin
+              fusion_src_a_q[127:0] <= p4_src_rd_data;
+              fusion_state_q <= F_EXT_HI_WAIT;
+            end
+          end
+
+          // Port-safe P3/P4 frame stores use synchronous RAM reads.
+          // Wait one cycle after changing the requested 16-lane half so
+          // F_EXT_HI cannot consume the still-valid previous low-half word.
+          F_EXT_HI_WAIT: begin
+            fusion_state_q <= F_EXT_HI;
+          end
+
+          F_EXT_HI: begin
+            if ((fusion_kind_q == 2'd0) && p3_src_rd_valid && p4_src_rd_valid) begin
+              fusion_src_a_q[255:128] <= p3_src_rd_data;
+              fusion_src_b_q[255:128] <= p4_src_rd_data;
+              fusion_state_q <= F_CALC;
+            end else if ((fusion_kind_q == 2'd1) && p4_src_rd_valid) begin
+              fusion_src_a_q[255:128] <= p4_src_rd_data;
+              fusion_state_q <= F_CALC;
+            end
+          end
+
+          F_CALC: begin
+
+            // --------------------------------------------------------------
+            // Segment 2:
+            // Retire the previous cycle's registered exact products.
+            // --------------------------------------------------------------
+            if (fusion_mul_valid_q) begin
+              for (int calc_lane=0;
+                   calc_lane<FUSION_LANES;
+                   calc_lane=calc_lane+1) begin
+
+                fusion_result_q[
+                  (fusion_mul_group_q*FUSION_LANES+calc_lane)*8 +: 8
+                ] <=
+                  sat_add_products40(
+                    fusion_mul_a_q[calc_lane],
+                    fusion_mul_b_q[calc_lane]
+                  );
+              end
+            end
+
+            // --------------------------------------------------------------
+            // Segment 1:
+            // Exact original 8x32 multiplication, now terminating at FFs.
+            // --------------------------------------------------------------
+            for (int calc_lane=0;
+                 calc_lane<FUSION_LANES;
+                 calc_lane=calc_lane+1) begin
+
+              fusion_mul_a_q[calc_lane] <=
+                mul_s8_u32_narrow(
+                  $signed(
+                    fusion_src_a_q[calc_lane*8 +: 8]
+                  ),
+                  $unsigned(fusion_ma)
+                );
+
+              fusion_mul_b_q[calc_lane] <=
+                mul_s8_u32_narrow(
+                  $signed(
+                    fusion_src_b_q[calc_lane*8 +: 8]
+                  ),
+                  $unsigned(fusion_mb)
+                );
+            end
+
+            // FUSION_SHIFT_V1_IMPLEMENTED
+            // Current low 32 bits feed the four multipliers.
+            // Shift next 4 INT8 lanes into place for next F_CALC cycle.
+            // Nonblocking assignments preserve current operands this cycle.
+            fusion_src_a_q <= fusion_src_a_q >> 32;
+            fusion_src_b_q <= fusion_src_b_q >> 32;
+
+            fusion_mul_valid_q <= 1'b1;
+            fusion_mul_group_q <= fusion_group_q;
+
+            if (fusion_group_q == GROUPS_PER_WORD-1) begin
+              fusion_state_q <= F_CALC_DRAIN;
+            end
+            else begin
+              fusion_group_q <= fusion_group_q + 1'b1;
+            end
+          end
+
+
+          // Final registered multiplication result must retire before write.
+          F_CALC_DRAIN: begin
+
+            if (fusion_mul_valid_q) begin
+              for (int calc_lane=0;
+                   calc_lane<FUSION_LANES;
+                   calc_lane=calc_lane+1) begin
+
+                fusion_result_q[
+                  (fusion_mul_group_q*FUSION_LANES+calc_lane)*8 +: 8
+                ] <=
+                  sat_add_products40(
+                    fusion_mul_a_q[calc_lane],
+                    fusion_mul_b_q[calc_lane]
+                  );
+              end
+            end
+
+            fusion_mul_valid_q <= 1'b0;
+            fusion_state_q <= F_WRITE;
+          end
+
+
+          F_WRITE: begin
+            if ((fusion_word_q + 1'b1) == fusion_words_for_stage(stage_id)) begin
+              fusion_state_q <= F_DONE;
+            end else begin
+              fusion_word_q <= fusion_word_q + 1'b1;
+              fusion_state_q <= F_PRIME;
+            end
+          end
+
+          F_DONE: begin
+            prepared_stage_q <= stage_id;
+            prepared_valid_q <= 1'b1;
+            fusion_state_q   <= F_IDLE;
+          end
+
+          default: fusion_state_q <= F_IDLE;
+        endcase
+
+        // Structural/runtime guards.  graph_error has exactly one owner.
+        if (p5_proj_valid && (p5_write_addr >= P5_WORDS))
+          graph_error <= 1'b1;
+        if (p5_capture_count > P5_WORDS)
+          graph_error <= 1'b1;
+        if (stage_prepare_req && (stage_id == 5'd0) &&
+            (p5_capture_count != P5_WORDS))
+          graph_error <= 1'b1;
+        if (out_valid && (stage_cout(out_stage_id) == 8'd128) &&
+            (out_co_tile > 6'd3))
+          graph_error <= 1'b1;
+        if (stage_write_en && (stage_write_addr >= MAX_WORDS))
+          graph_error <= 1'b1;
+      end
+    end
+  end
+
+`ifndef SYNTHESIS
+  // POSTSWIN_ADDRCTRL_V1: configuration/stream alignment guard.
+  always_ff @(posedge clk) begin
+    if (rst_n && adapter_stream_valid) begin
+      if (!cfg_valid_q)
+        $fatal(1,
+          "ADDRCTRL_V1 stream before registered stage configuration");
+
+      if (cfg_stage_q != stage_id)
+        $fatal(1,
+          "ADDRCTRL_V1 stage/config mismatch stage=%0d cfg=%0d",
+          stage_id, cfg_stage_q);
+    end
+  end
+
+  initial begin
+    if (PE_K != 32 || PE_N != 32)
+      $fatal(1, "continuous tensor adapter requires PE_K=PE_N=32");
+    if (FUSION_LANES != 4)
+      $fatal(1, "continuous tensor adapter V65_POSTOPT_V2 requires FUSION_LANES=4");
+    if ((32 % FUSION_LANES) != 0)
+      $fatal(1, "continuous tensor adapter FUSION_LANES must divide 32");
+    $display("[CONTINUOUS_TENSOR_V65_POSTOPT_V2_COMPILED] %m URAM_GRAPH FUSION%0d_NODSP", FUSION_LANES);
+  end
+
+  always_ff @(posedge clk) begin
+    if (rst_n && graph_error)
+      $fatal(1, "continuous tensor graph error stage=%0d fusion=%0d word=%0d p5count=%0d",
+             stage_id, fusion_kind_q, fusion_word_q, p5_capture_count);
+  end
+`endif
+endmodule

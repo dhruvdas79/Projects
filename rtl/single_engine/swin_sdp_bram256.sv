@@ -1,0 +1,32 @@
+`timescale 1ns/1ps
+module swin_sdp_bram256 #(
+  parameter int DEPTH  = 128,
+  parameter int ADDR_W = 7,
+  parameter RAM_STYLE = "block"
+)(
+  input  logic clk,
+  input  logic rst_n,
+  input  logic wr_en,
+  input  logic [ADDR_W-1:0] wr_addr,
+  input  logic signed [255:0] wr_data,
+  input  logic rd_en,
+  input  logic [ADDR_W-1:0] rd_addr,
+  output logic rd_valid,
+  output logic signed [255:0] rd_data
+);
+  (* ram_style = RAM_STYLE *) logic signed [255:0] mem [0:DEPTH-1];
+  always_ff @(posedge clk) begin
+    if (wr_en) mem[wr_addr] <= wr_data;
+    if (rd_en) rd_data <= mem[rd_addr];
+  end
+  always_ff @(posedge clk) begin
+    if (!rst_n) rd_valid <= 1'b0;
+    else rd_valid <= rd_en;
+  end
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) begin
+    if (rst_n && wr_en && ($unsigned(wr_addr) >= DEPTH)) $fatal(1,"swin_sdp_bram256 write address out of range");
+    if (rst_n && rd_en && ($unsigned(rd_addr) >= DEPTH)) $fatal(1,"swin_sdp_bram256 read address out of range");
+  end
+`endif
+endmodule

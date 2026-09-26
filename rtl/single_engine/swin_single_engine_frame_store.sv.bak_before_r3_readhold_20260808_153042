@@ -1,0 +1,255 @@
+`timescale 1ns/1ps
+// ============================================================================
+// swin_single_engine_frame_store.sv
+//
+// STRICT SYNTHESIS-INFERENCE VERSION
+//
+// Persistent P3/P4 memories expose exactly ONE write port and ONE synchronous
+// read port each. Projection/store writes are arbitrated BEFORE the RAM.
+// Engine/debug reads are arbitrated BEFORE the RAM; normal engine traffic has
+// priority. This avoids describing 3-4 logical ports on BRAM/URAM.
+//
+// Ping-pong bank_a/b remain one-write + one-synchronous-read memories.
+// No memory array is reset.
+// ============================================================================
+module swin_single_engine_frame_store (
+  input  logic clk,
+
+  input  logic p3_proj_wr_valid,
+  input  logic [11:0] p3_proj_wr_pixel,
+  input  logic [1:0] p3_proj_wr_co_tile,
+  input  logic signed [255:0] p3_proj_wr_data,
+  input  logic p4_proj_wr_valid,
+  input  logic [9:0] p4_proj_wr_pixel,
+  input  logic [1:0] p4_proj_wr_co_tile,
+  input  logic signed [255:0] p4_proj_wr_data,
+
+  input  logic store_rd_en,
+  input  logic store_sel_p3,
+  input  logic [11:0] store_rd_pixel,
+  input  logic [1:0] store_rd_co_tile,
+  output logic store_rd_valid,
+  output logic signed [255:0] store_rd_data,
+  input  logic store_wr_en,
+  input  logic store_wr_sel_p3,
+  input  logic [11:0] store_wr_pixel,
+  input  logic [1:0] store_wr_co_tile,
+  input  logic signed [255:0] store_wr_data,
+
+  input  logic a_rd_en,
+  input  logic [11:0] a_rd_pixel,
+  input  logic [1:0] a_rd_co_tile,
+  output logic a_rd_valid,
+  output logic signed [255:0] a_rd_data,
+  input  logic a_wr_en,
+  input  logic [11:0] a_wr_pixel,
+  input  logic [1:0] a_wr_co_tile,
+  input  logic signed [255:0] a_wr_data,
+
+  input  logic b_rd_en,
+  input  logic [11:0] b_rd_pixel,
+  input  logic [1:0] b_rd_co_tile,
+  output logic b_rd_valid,
+  output logic signed [255:0] b_rd_data,
+  input  logic b_wr_en,
+  input  logic [11:0] b_wr_pixel,
+  input  logic [1:0] b_wr_co_tile,
+  input  logic signed [255:0] b_wr_data,
+
+  input  logic p4_dbg_rd_en,
+  input  logic [9:0] p4_dbg_rd_pixel,
+  input  logic [2:0] p4_dbg_rd_co_tile16,
+  output logic p4_dbg_rd_valid,
+  output logic signed [127:0] p4_dbg_rd_data,
+  input  logic p3_dbg_rd_en,
+  input  logic [11:0] p3_dbg_rd_pixel,
+  input  logic [2:0] p3_dbg_rd_co_tile16,
+  output logic p3_dbg_rd_valid,
+  output logic signed [127:0] p3_dbg_rd_data
+);
+  localparam int P3_WORDS  = 2704*4;
+  localparam int P4_WORDS  = 676*4;
+  localparam int P3_ADDR_W = $clog2(P3_WORDS);
+  localparam int P4_ADDR_W = $clog2(P4_WORDS);
+
+  (* ram_style="ultra" *) logic signed [255:0] p3_mem [0:P3_WORDS-1];
+  (* ram_style="block" *) logic signed [255:0] p4_mem [0:P4_WORDS-1];
+  (* ram_style="ultra" *) logic signed [255:0] bank_a [0:P3_WORDS-1];
+  (* ram_style="ultra" *) logic signed [255:0] bank_b [0:P3_WORDS-1];
+
+  function automatic int unsigned addr32(input logic [11:0] pixel,input logic [1:0] co);
+    addr32 = ($unsigned(pixel)<<2)+$unsigned(co);
+  endfunction
+
+  logic p3_wr_en;
+  logic [P3_ADDR_W-1:0] p3_wr_addr;
+  logic signed [255:0] p3_wr_data;
+  logic p4_wr_en;
+  logic [P4_ADDR_W-1:0] p4_wr_addr;
+  logic signed [255:0] p4_wr_data;
+
+  always_comb begin
+    p3_wr_en   = 1'b0;
+    p3_wr_addr = '0;
+    p3_wr_data = '0;
+    if (store_wr_en && store_wr_sel_p3) begin
+      p3_wr_en   = 1'b1;
+      p3_wr_addr = addr32(store_wr_pixel,store_wr_co_tile);
+      p3_wr_data = store_wr_data;
+    end else if (p3_proj_wr_valid) begin
+      p3_wr_en   = 1'b1;
+      p3_wr_addr = addr32(p3_proj_wr_pixel,p3_proj_wr_co_tile);
+      p3_wr_data = p3_proj_wr_data;
+    end
+
+    p4_wr_en   = 1'b0;
+    p4_wr_addr = '0;
+    p4_wr_data = '0;
+    if (store_wr_en && !store_wr_sel_p3) begin
+      p4_wr_en   = 1'b1;
+      p4_wr_addr = addr32(store_wr_pixel,store_wr_co_tile);
+      p4_wr_data = store_wr_data;
+    end else if (p4_proj_wr_valid) begin
+      p4_wr_en   = 1'b1;
+      p4_wr_addr = addr32({2'b0,p4_proj_wr_pixel},p4_proj_wr_co_tile);
+      p4_wr_data = p4_proj_wr_data;
+    end
+  end
+
+  logic p3_rd_en, p3_rd_owner_store;
+  logic [P3_ADDR_W-1:0] p3_rd_addr;
+  logic [2:0] p3_rd_dbg_tile;
+  logic p4_rd_en, p4_rd_owner_store;
+  logic [P4_ADDR_W-1:0] p4_rd_addr;
+  logic [2:0] p4_rd_dbg_tile;
+
+  always_comb begin
+    p3_rd_en          = 1'b0;
+    p3_rd_owner_store = 1'b0;
+    p3_rd_addr        = '0;
+    p3_rd_dbg_tile    = '0;
+    if (store_rd_en && store_sel_p3) begin
+      p3_rd_en          = 1'b1;
+      p3_rd_owner_store = 1'b1;
+      p3_rd_addr        = addr32(store_rd_pixel,store_rd_co_tile);
+    end else if (p3_dbg_rd_en) begin
+      p3_rd_en          = 1'b1;
+      p3_rd_owner_store = 1'b0;
+      p3_rd_addr        = addr32(p3_dbg_rd_pixel,p3_dbg_rd_co_tile16[2:1]);
+      p3_rd_dbg_tile    = p3_dbg_rd_co_tile16;
+    end
+
+    p4_rd_en          = 1'b0;
+    p4_rd_owner_store = 1'b0;
+    p4_rd_addr        = '0;
+    p4_rd_dbg_tile    = '0;
+    if (store_rd_en && !store_sel_p3) begin
+      p4_rd_en          = 1'b1;
+      p4_rd_owner_store = 1'b1;
+      p4_rd_addr        = addr32(store_rd_pixel,store_rd_co_tile);
+    end else if (p4_dbg_rd_en) begin
+      p4_rd_en          = 1'b1;
+      p4_rd_owner_store = 1'b0;
+      p4_rd_addr        = addr32({2'b0,p4_dbg_rd_pixel},p4_dbg_rd_co_tile16[2:1]);
+      p4_rd_dbg_tile    = p4_dbg_rd_co_tile16;
+    end
+  end
+
+  logic p3_rd_valid_q, p3_rd_owner_store_q;
+  logic [2:0] p3_rd_dbg_tile_q;
+  logic signed [255:0] p3_rd_word_q;
+  logic p4_rd_valid_q, p4_rd_owner_store_q;
+  logic [2:0] p4_rd_dbg_tile_q;
+  logic signed [255:0] p4_rd_word_q;
+
+  // Hold the identity of the last normal engine read beyond the one-cycle
+  // read-valid pulse. E_LOAD_WRITE consumes store_rd_data one cycle after
+  // E_LOAD_WAIT observes store_rd_valid, so data must remain selected even
+  // after p*_rd_valid_q deasserts.
+  logic store_rd_sel_p3_q;
+
+  // Exactly one write statement and one indexed read statement per persistent RAM.
+  always_ff @(posedge clk) begin
+    if (p3_wr_en)
+      p3_mem[p3_wr_addr] <= p3_wr_data;
+    if (p3_rd_en)
+      p3_rd_word_q <= p3_mem[p3_rd_addr];
+
+    p3_rd_valid_q <= p3_rd_en;
+    if (p3_rd_en) begin
+      p3_rd_owner_store_q <= p3_rd_owner_store;
+      p3_rd_dbg_tile_q    <= p3_rd_dbg_tile;
+    end
+  end
+
+  always_ff @(posedge clk) begin
+    if (p4_wr_en)
+      p4_mem[p4_wr_addr] <= p4_wr_data;
+    if (p4_rd_en)
+      p4_rd_word_q <= p4_mem[p4_rd_addr];
+
+    p4_rd_valid_q <= p4_rd_en;
+    if (p4_rd_en) begin
+      p4_rd_owner_store_q <= p4_rd_owner_store;
+      p4_rd_dbg_tile_q    <= p4_rd_dbg_tile;
+    end
+  end
+
+  // Preserve the selected persistent-memory source after the response-valid
+  // pulse. This restores the original frame-store contract: store_rd_data
+  // remains stable during the following E_LOAD_WRITE cycle.
+  always_ff @(posedge clk) begin
+    if (p3_rd_en && p3_rd_owner_store)
+      store_rd_sel_p3_q <= 1'b1;
+    else if (p4_rd_en && p4_rd_owner_store)
+      store_rd_sel_p3_q <= 1'b0;
+  end
+
+  // Ping-pong memories: one write + one synchronous read each.
+  always_ff @(posedge clk) begin
+    if (a_wr_en)
+      bank_a[addr32(a_wr_pixel,a_wr_co_tile)] <= a_wr_data;
+    a_rd_valid <= a_rd_en;
+    if (a_rd_en)
+      a_rd_data <= bank_a[addr32(a_rd_pixel,a_rd_co_tile)];
+  end
+
+  always_ff @(posedge clk) begin
+    if (b_wr_en)
+      bank_b[addr32(b_wr_pixel,b_wr_co_tile)] <= b_wr_data;
+    b_rd_valid <= b_rd_en;
+    if (b_rd_en)
+      b_rd_data <= bank_b[addr32(b_rd_pixel,b_rd_co_tile)];
+  end
+
+  always_comb begin
+    store_rd_valid = (p3_rd_valid_q && p3_rd_owner_store_q) ||
+                     (p4_rd_valid_q && p4_rd_owner_store_q);
+
+    // IMPORTANT: do not gate store_rd_data with store_rd_valid. The Swin FSM
+    // sees store_rd_valid in E_LOAD_WAIT and consumes store_rd_data in the
+    // subsequent E_LOAD_WRITE cycle, when p*_rd_valid_q has already dropped.
+    store_rd_data = store_rd_sel_p3_q ? p3_rd_word_q : p4_rd_word_q;
+
+    p3_dbg_rd_valid = p3_rd_valid_q && !p3_rd_owner_store_q;
+    p3_dbg_rd_data  = p3_rd_dbg_tile_q[0] ?
+                      p3_rd_word_q[255:128] : p3_rd_word_q[127:0];
+
+    p4_dbg_rd_valid = p4_rd_valid_q && !p4_rd_owner_store_q;
+    p4_dbg_rd_data  = p4_rd_dbg_tile_q[0] ?
+                      p4_rd_word_q[255:128] : p4_rd_word_q[127:0];
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) begin
+    if (p3_proj_wr_valid && store_wr_en && store_wr_sel_p3)
+      $fatal(1,"frame_store: simultaneous P3 projection/store writes");
+    if (p4_proj_wr_valid && store_wr_en && !store_wr_sel_p3)
+      $fatal(1,"frame_store: simultaneous P4 projection/store writes");
+    if (p3_dbg_rd_en && store_rd_en && store_sel_p3)
+      $fatal(1,"frame_store: simultaneous P3 engine/debug reads");
+    if (p4_dbg_rd_en && store_rd_en && !store_sel_p3)
+      $fatal(1,"frame_store: simultaneous P4 engine/debug reads");
+  end
+`endif
+endmodule

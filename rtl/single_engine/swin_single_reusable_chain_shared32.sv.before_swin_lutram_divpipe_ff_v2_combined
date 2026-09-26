@@ -1,0 +1,767 @@
+`timescale 1ns/1ps
+// ============================================================================
+// One physical Swin engine for all six logical blocks.
+//   P4_0 -> P4_1 -> P4_2 -> P4_3 -> P3_0 -> P3_1
+// The engine uses two max-P3 frame buffers. Q/K/V/context are window-local and
+// FC1 is token-local, so no per-block full-frame intermediates are replicated.
+// All block assets are supplied by an external cache/DDR adapter.
+// ============================================================================
+module swin_single_reusable_chain_shared32 #(
+  parameter int PE_K=32,parameter int PE_N=32
+)(
+  input logic clk,input logic rst_n,
+  input logic p4_start,output logic p4_busy,output logic p4_done,
+  input logic p3_start,output logic p3_busy,output logic p3_done,
+
+  input logic p4_proj_wr_valid,input logic [9:0] p4_proj_wr_pixel,
+  input logic [1:0] p4_proj_wr_co_tile,input logic signed [255:0] p4_proj_wr_data,
+  input logic p3_proj_wr_valid,input logic [11:0] p3_proj_wr_pixel,
+  input logic [1:0] p3_proj_wr_co_tile,input logic signed [255:0] p3_proj_wr_data,
+
+  input logic p4_out_rd_en,input logic [9:0] p4_out_rd_pixel,input logic [2:0] p4_out_rd_co_tile,
+  output logic p4_out_rd_valid,output logic signed [127:0] p4_out_rd_data,
+  input logic p3_out_rd_en,input logic [11:0] p3_out_rd_pixel,input logic [2:0] p3_out_rd_co_tile,
+  output logic p3_out_rd_valid,output logic signed [127:0] p3_out_rd_data,
+
+  // Dense asset cache.
+  output logic weight_req_valid,output logic [2:0] weight_req_block,
+  output logic [2:0] weight_req_stage,output logic [3:0] weight_req_ci_tile,
+  output logic [3:0] weight_req_co_tile,output logic [4:0] weight_req_row,
+  input logic weight_resp_valid,input logic signed [255:0] weight_resp_data,
+  output logic postparam_req_valid,output logic [2:0] postparam_req_block,
+  output logic [2:0] postparam_req_stage,output logic [3:0] postparam_req_co_tile,
+  input logic postparam_resp_valid,input logic signed [31:0] postparam_bias[0:31],
+  input logic signed [31:0] postparam_multiplier[0:31],input logic signed [15:0] postparam_shift[0:31],
+
+  // Norm/Poly vector LUT cache.
+  output logic norm_req_valid,output logic [2:0] norm_req_block,output logic norm_req_sel,output logic [1:0] norm_req_co_tile,
+  output logic signed [7:0] norm_req_code[0:31],input logic norm_resp_valid,
+  input logic signed [7:0] norm_resp_value[0:31],
+  output logic poly_req_valid,output logic [2:0] poly_req_block,
+  output logic signed [7:0] poly_req_code[0:31],input logic poly_resp_valid,
+  input logic signed [7:0] poly_resp_value[0:31],
+
+  // Residual scale cache; each response is one scalar parameter set.
+  output logic resparam_req_valid,output logic [2:0] resparam_req_block,output logic resparam_req_sel,
+  input logic resparam_resp_valid,input logic [31:0] resparam_a_mult,
+  input logic signed [15:0] resparam_a_shift,input logic [31:0] resparam_b_mult,
+  input logic signed [15:0] resparam_b_shift,
+
+  // Attention tables.
+  output logic relpos_req_valid,output logic [2:0] relpos_req_block,
+  output logic [2:0] relpos_req_head,output logic [4:0] relpos_req_query,
+  input logic relpos_resp_valid,input logic signed [15:0] relpos_resp_bias[0:31],
+  output logic exp_req_valid,output logic [2:0] exp_req_block,
+  output logic signed [7:0] exp_req_delta[0:31],input logic exp_resp_valid,
+  input logic [15:0] exp_resp_value[0:31],
+
+  // Aggregate client port to the one global shared 32x32 MAC service.
+  output logic client_req,input logic client_grant,
+  output logic [11:0] client_cfg_tokens_m1,output logic [3:0] client_cfg_k_tiles_m1,
+  output logic [3:0] client_cfg_n_tiles_m1,output logic client_input_valid,
+  output logic client_weight_valid,output logic signed [8:0] client_input_vector[0:31],
+  output logic signed [8:0] client_weight_row_values[0:31],
+  input logic svc_stream_valid,input logic [11:0] svc_stream_token_id,
+  input logic [3:0] svc_active_ci_tile,input logic [3:0] svc_active_co_tile,
+  input logic svc_weight_row_load,input logic [4:0] svc_weight_row_index,
+  input logic svc_done,input logic svc_raw_valid,input logic [11:0] svc_raw_token_id,
+  input logic [3:0] svc_raw_co_tile,input logic signed [63:0] svc_raw_acc[0:31],
+
+  // One global requant service.
+  output logic post_in_valid,output logic [5:0] post_in_route,
+  output logic [1:0] post_in_op,output logic [1:0] post_in_layer,
+  output logic [11:0] post_in_token,output logic [6:0] post_in_co,
+  output logic signed [63:0] post_in_value[0:31],
+  output logic signed [31:0] post_in_multiplier[0:31],
+  output logic signed [15:0] post_in_shift[0:31],
+  input logic post_out_valid,input logic [5:0] post_out_route,
+  input logic [1:0] post_out_op,input logic [1:0] post_out_layer,
+  input logic [11:0] post_out_token,input logic [6:0] post_out_co,
+  input logic signed [7:0] post_out_code[0:31],
+
+  output logic [2:0] active_block,output logic [5:0] engine_state,
+  output logic [31:0] block_cycle_count
+);
+  import swin_single_engine_cfg_pkg::*;
+  block_cfg_t cfg_q;
+
+  // ------------------------- Frame storage ---------------------------------
+  logic store_rd_en,store_sel_p3,store_rd_valid,store_wr_en,store_wr_sel_p3;
+  logic [11:0] store_rd_pixel,store_wr_pixel;logic [1:0] store_rd_co,store_wr_co;
+  logic signed [255:0] store_rd_data,store_wr_data;
+  logic a_rd_en,a_rd_valid,a_wr_en,b_rd_en,b_rd_valid,b_wr_en;
+  logic [11:0] a_rd_pixel,a_wr_pixel,b_rd_pixel,b_wr_pixel;
+  logic [1:0] a_rd_co,a_wr_co,b_rd_co,b_wr_co;
+  logic signed [255:0] a_rd_data,a_wr_data,b_rd_data,b_wr_data;
+
+  swin_single_engine_frame_store u_frames(
+    .clk,
+    .p3_proj_wr_valid,.p3_proj_wr_pixel,.p3_proj_wr_co_tile,.p3_proj_wr_data,
+    .p4_proj_wr_valid,.p4_proj_wr_pixel,.p4_proj_wr_co_tile,.p4_proj_wr_data,
+    .store_rd_en,.store_sel_p3,.store_rd_pixel,.store_rd_co_tile(store_rd_co),.store_rd_valid,.store_rd_data,
+    .store_wr_en,.store_wr_sel_p3,.store_wr_pixel,.store_wr_co_tile(store_wr_co),.store_wr_data,
+    .a_rd_en,.a_rd_pixel,.a_rd_co_tile(a_rd_co),.a_rd_valid,.a_rd_data,
+    .a_wr_en,.a_wr_pixel,.a_wr_co_tile(a_wr_co),.a_wr_data,
+    .b_rd_en,.b_rd_pixel,.b_rd_co_tile(b_rd_co),.b_rd_valid,.b_rd_data,
+    .b_wr_en,.b_wr_pixel,.b_wr_co_tile(b_wr_co),.b_wr_data,
+    .p4_dbg_rd_en(p4_out_rd_en),.p4_dbg_rd_pixel(p4_out_rd_pixel),.p4_dbg_rd_co_tile16(p4_out_rd_co_tile),
+    .p4_dbg_rd_valid(p4_out_rd_valid),.p4_dbg_rd_data(p4_out_rd_data),
+    .p3_dbg_rd_en(p3_out_rd_en),.p3_dbg_rd_pixel(p3_out_rd_pixel),.p3_dbg_rd_co_tile16(p3_out_rd_co_tile),
+    .p3_dbg_rd_valid(p3_out_rd_valid),.p3_dbg_rd_data(p3_out_rd_data)
+  );
+
+  // Q/K/V use synchronous BRAM ports. K is transposed once after its dense
+  // pass so the weight-stationary MAC can fetch one feature row per cycle.
+  logic qkv_q_wr_en,qkv_kv_wr_en,qkv_transpose_start;
+  logic [4:0] qkv_wr_token;
+  logic [1:0] qkv_wr_co;
+  logic qkv_transpose_busy,qkv_transpose_done;
+  logic q_rd_en,q_rd_valid,k_rd_en,k_rd_valid,v_rd_en,v_rd_valid;
+  logic [4:0] q_rd_token,k_rd_row,v_rd_token;
+  logic [1:0] q_rd_co,k_rd_co,v_rd_co;
+  logic signed [255:0] q_rd_data,k_rd_data,v_rd_data;
+
+  // V1.1: all dense-source memories use synchronous 1W+1R BRAM.
+  localparam int MLP_BATCH_TOKENS = 256;
+  logic signed [255:0] norm_resp_packed, poly_resp_packed;
+  always_comb begin : PACK_VECTOR_RESP_V11
+    norm_resp_packed='0; poly_resp_packed='0;
+    for (int pack_lane=0; pack_lane<32; pack_lane=pack_lane+1) begin
+      norm_resp_packed[pack_lane*8 +: 8]=norm_resp_value[pack_lane];
+      poly_resp_packed[pack_lane*8 +: 8]=poly_resp_value[pack_lane];
+    end
+  end
+
+  logic win_mem_wr_en,win_mem_rd_en,win_mem_rd_valid;
+  logic [6:0] win_mem_wr_addr,win_mem_rd_addr;
+  logic signed [255:0] win_mem_wr_data,win_mem_rd_data;
+  logic ctx_mem_wr_en,ctx_mem_rd_en,ctx_mem_rd_valid;
+  logic [6:0] ctx_mem_wr_addr,ctx_mem_rd_addr;
+  logic signed [255:0] ctx_mem_wr_data,ctx_mem_rd_data;
+  logic norm2_mem_wr_en,norm2_mem_rd_en,norm2_mem_rd_valid;
+  logic [9:0] norm2_mem_wr_addr,norm2_mem_rd_addr;
+  logic signed [255:0] norm2_mem_wr_data,norm2_mem_rd_data;
+  logic fc1_mem_wr_en,fc1_mem_rd_en,fc1_mem_rd_valid;
+  logic [11:0] fc1_mem_wr_addr,fc1_mem_rd_addr;
+  logic signed [255:0] fc1_mem_wr_data,fc1_mem_rd_data;
+
+  swin_sdp_bram256 #(.DEPTH(128),.ADDR_W(7)) u_win_mem(
+    .clk,.rst_n,.wr_en(win_mem_wr_en),.wr_addr(win_mem_wr_addr),.wr_data(win_mem_wr_data),
+    .rd_en(win_mem_rd_en),.rd_addr(win_mem_rd_addr),.rd_valid(win_mem_rd_valid),.rd_data(win_mem_rd_data));
+  swin_sdp_bram256 #(.DEPTH(128),.ADDR_W(7)) u_ctx_mem(
+    .clk,.rst_n,.wr_en(ctx_mem_wr_en),.wr_addr(ctx_mem_wr_addr),.wr_data(ctx_mem_wr_data),
+    .rd_en(ctx_mem_rd_en),.rd_addr(ctx_mem_rd_addr),.rd_valid(ctx_mem_rd_valid),.rd_data(ctx_mem_rd_data));
+  swin_sdp_bram256 #(.DEPTH(1024),.ADDR_W(10)) u_norm2_batch_mem(
+    .clk,.rst_n,.wr_en(norm2_mem_wr_en),.wr_addr(norm2_mem_wr_addr),.wr_data(norm2_mem_wr_data),
+    .rd_en(norm2_mem_rd_en),.rd_addr(norm2_mem_rd_addr),.rd_valid(norm2_mem_rd_valid),.rd_data(norm2_mem_rd_data));
+  swin_sdp_bram256 #(.DEPTH(4096),.ADDR_W(12)) u_fc1_batch_mem(
+    .clk,.rst_n,.wr_en(fc1_mem_wr_en),.wr_addr(fc1_mem_wr_addr),.wr_data(fc1_mem_wr_data),
+    .rd_en(fc1_mem_rd_en),.rd_addr(fc1_mem_rd_addr),.rd_valid(fc1_mem_rd_valid),.rd_data(fc1_mem_rd_data));
+
+`ifndef SYNTHESIS
+  logic signed [255:0] win_x[0:99];
+  logic signed [255:0] ctx_local[0:99];
+  logic signed [255:0] norm2_batch[0:(MLP_BATCH_TOKENS*4)-1];
+  logic signed [255:0] fc1_batch[0:(MLP_BATCH_TOKENS*16)-1];
+`endif
+
+  // ------------------------- Dense client ----------------------------------
+  logic dense_start,dense_busy,dense_done;
+  logic [2:0] dense_stage_q;
+  (* max_fanout = 64 *) logic [2:0] dense_stage_hold_q; // V65_PHASE_A_V2 HOLD_DECL
+  logic [11:0] dense_tokens_m1_q;logic [3:0] dense_ktiles_m1_q,dense_ntiles_m1_q;
+  logic dense_src_req;logic [11:0] dense_src_token;logic [3:0] dense_src_ci;
+  logic dense_src_valid;logic signed [255:0] dense_src_data;
+  logic dense_out_valid;logic [2:0] dense_out_stage;logic [11:0] dense_out_token;
+  logic [3:0] dense_out_co;logic signed [255:0] dense_out_data;
+  logic d_client_req,d_client_grant,d_client_input_valid,d_client_weight_valid;
+  logic [11:0] d_cfg_tokens;logic [3:0] d_cfg_k,d_cfg_n;
+  logic signed [8:0] d_input[0:31],d_weight[0:31];
+
+  swin_runtime_dense_client #(.ROUTE_ID(1)) u_dense(
+    .clk,.rst_n,.start(dense_start),.block_id(active_block),.dense_stage(dense_stage_q),
+    .cfg_tokens_m1_i(dense_tokens_m1_q),.cfg_k_tiles_m1_i(dense_ktiles_m1_q),
+    .cfg_n_tiles_m1_i(dense_ntiles_m1_q),.busy(dense_busy),.done(dense_done),
+    .src_req_valid(dense_src_req),.src_req_token(dense_src_token),.src_req_ci_tile(dense_src_ci),
+    .src_resp_valid(dense_src_valid),.src_resp_data(dense_src_data),
+    .weight_req_valid,.weight_req_block,.weight_req_stage,.weight_req_ci_tile,.weight_req_co_tile,.weight_req_row,
+    .weight_resp_valid,.weight_resp_data,
+    .postparam_req_valid,.postparam_req_block,.postparam_req_stage,.postparam_req_co_tile,
+    .postparam_resp_valid,.postparam_bias,.postparam_multiplier,.postparam_shift,
+    .out_valid(dense_out_valid),.out_stage(dense_out_stage),.out_token(dense_out_token),
+    .out_co_tile(dense_out_co),.out_data(dense_out_data),
+    .client_req(d_client_req),.client_grant(d_client_grant),.client_cfg_tokens_m1(d_cfg_tokens),
+    .client_cfg_k_tiles_m1(d_cfg_k),.client_cfg_n_tiles_m1(d_cfg_n),
+    .client_input_valid(d_client_input_valid),.client_weight_valid(d_client_weight_valid),
+    .client_input_vector(d_input),.client_weight_row_values(d_weight),
+    .svc_stream_valid,.svc_stream_token_id,.svc_active_ci_tile,.svc_active_co_tile,
+    .svc_weight_row_load,.svc_weight_row_index,.svc_done,.svc_raw_valid,.svc_raw_token_id,.svc_raw_co_tile,.svc_raw_acc,
+    .post_in_valid,.post_in_route,.post_in_op,.post_in_layer,.post_in_token,.post_in_co,
+    .post_in_value,.post_in_multiplier,.post_in_shift,
+    .post_out_valid,.post_out_route,.post_out_op,.post_out_layer,.post_out_token,.post_out_co,.post_out_code
+  );
+
+  assign qkv_q_wr_en=dense_out_valid&&(dense_out_stage==DENSE_Q);
+  assign qkv_kv_wr_en=dense_out_valid&&
+                      ((dense_out_stage==DENSE_K)||(dense_out_stage==DENSE_V));
+  assign qkv_wr_token=dense_out_token[4:0];
+  assign qkv_wr_co=dense_out_co[1:0];
+
+  swin_local_qkv_bram u_local_qkv(
+    .clk,.rst_n,
+    .q_wr_en(qkv_q_wr_en),.q_wr_token(qkv_wr_token),.q_wr_co(qkv_wr_co),
+    .q_wr_data(dense_out_data),
+    .kv_wr_en(qkv_kv_wr_en),.kv_wr_token(qkv_wr_token),.kv_wr_co(qkv_wr_co),
+    .kv_wr_data(dense_out_data),
+    .transpose_start(qkv_transpose_start),.transpose_tokens(cfg_q.window_tokens),
+    .transpose_busy(qkv_transpose_busy),.transpose_done(qkv_transpose_done),
+    .q_rd_en,.q_rd_token,.q_rd_co,.q_rd_valid,.q_rd_data,
+    .k_rd_en,.k_rd_co,.k_rd_row,.k_rd_valid,.k_rd_data,
+    .v_rd_en,.v_rd_token,.v_rd_co,.v_rd_valid,.v_rd_data
+  );
+
+  // V65_PHASE_A_V2 HOLD_REG: capture dense stage once when START is asserted.
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      dense_stage_hold_q <= DENSE_Q;
+    end else if (dense_start) begin
+      dense_stage_hold_q <= dense_stage_q;
+    end
+  end
+
+  // V1.1 synchronous dense-source read selection.
+  always_comb begin
+    win_mem_rd_en=1'b0; win_mem_rd_addr={dense_src_token[4:0],dense_src_ci[1:0]};
+    ctx_mem_rd_en=1'b0; ctx_mem_rd_addr={dense_src_token[4:0],dense_src_ci[1:0]};
+    norm2_mem_rd_en=1'b0; norm2_mem_rd_addr={dense_src_token[7:0],dense_src_ci[1:0]};
+    fc1_mem_rd_en=1'b0; fc1_mem_rd_addr={dense_src_token[7:0],dense_src_ci[3:0]};
+    if(dense_src_req) begin
+      case(dense_stage_hold_q)
+        DENSE_Q,DENSE_K,DENSE_V: win_mem_rd_en=1'b1;
+        DENSE_PROJ: ctx_mem_rd_en=1'b1;
+        DENSE_FC1: norm2_mem_rd_en=1'b1;
+        default: fc1_mem_rd_en=1'b1;
+      endcase
+    end
+    dense_src_valid=1'b0; dense_src_data='0;
+    if(win_mem_rd_valid) begin dense_src_valid=1'b1; dense_src_data=win_mem_rd_data; end
+    else if(ctx_mem_rd_valid) begin dense_src_valid=1'b1; dense_src_data=ctx_mem_rd_data; end
+    else if(norm2_mem_rd_valid) begin dense_src_valid=1'b1; dense_src_data=norm2_mem_rd_data; end
+    else if(fc1_mem_rd_valid) begin dense_src_valid=1'b1; dense_src_data=fc1_mem_rd_data; end
+  end
+
+  // ------------------------- Attention client ------------------------------
+  logic attn_start,attn_busy,attn_done,attn_ctx_valid;
+  logic [4:0] attn_ctx_token;logic [1:0] attn_ctx_co;logic signed [255:0] attn_ctx_data;
+  logic a_client_req,a_client_grant,a_client_input_valid,a_client_weight_valid;
+  logic [11:0] a_cfg_tokens;logic [3:0] a_cfg_k,a_cfg_n;
+  logic signed [8:0] a_input[0:31],a_weight[0:31];
+
+  swin_runtime_attention_client u_attn(
+    .clk,.rst_n,.start(attn_start),.block_id(active_block),.cfg_heads(cfg_q.heads),
+    .cfg_tokens(cfg_q.window_tokens),.cfg_chunks(cfg_q.head_dim[6:5]),
+    .cfg_qk_m(cfg_q.qk_m),.cfg_qk_shift(cfg_q.qk_shift),.cfg_ctx_m(cfg_q.ctx_m),.cfg_ctx_shift(cfg_q.ctx_shift),
+    .q_rd_en,.q_rd_token,.q_rd_co,.q_rd_valid,.q_rd_data,
+    .k_rd_en,.k_rd_co,.k_rd_row,.k_rd_valid,.k_rd_data,
+    .v_rd_en,.v_rd_token,.v_rd_co,.v_rd_valid,.v_rd_data,
+    .busy(attn_busy),.done(attn_done),
+    .ctx_valid(attn_ctx_valid),.ctx_token(attn_ctx_token),.ctx_co_tile(attn_ctx_co),.ctx_data(attn_ctx_data),
+    .relpos_req_valid,.relpos_req_block,.relpos_req_head,.relpos_req_query,.relpos_resp_valid,.relpos_resp_bias,
+    .exp_req_valid,.exp_req_block,.exp_req_delta,.exp_resp_valid,.exp_resp_value,
+    .client_req(a_client_req),.client_grant(a_client_grant),.client_cfg_tokens_m1(a_cfg_tokens),
+    .client_cfg_k_tiles_m1(a_cfg_k),.client_cfg_n_tiles_m1(a_cfg_n),
+    .client_input_valid(a_client_input_valid),.client_weight_valid(a_client_weight_valid),
+    .client_input_vector(a_input),.client_weight_row_values(a_weight),
+    .svc_stream_valid,.svc_stream_token_id,.svc_active_ci_tile,.svc_active_co_tile,
+    .svc_weight_row_load,.svc_weight_row_index,.svc_done,.svc_raw_valid,.svc_raw_token_id,.svc_raw_co_tile,.svc_raw_acc
+  );
+
+  // Dense and attention are mutually exclusive users of the one global MAC.
+  logic mac_sel_attn;
+  assign client_req=mac_sel_attn?a_client_req:d_client_req;
+  assign a_client_grant=client_grant&&mac_sel_attn;
+  assign d_client_grant=client_grant&&!mac_sel_attn;
+  assign client_cfg_tokens_m1=mac_sel_attn?a_cfg_tokens:d_cfg_tokens;
+  assign client_cfg_k_tiles_m1=mac_sel_attn?a_cfg_k:d_cfg_k;
+  assign client_cfg_n_tiles_m1=mac_sel_attn?a_cfg_n:d_cfg_n;
+  assign client_input_valid=mac_sel_attn?a_client_input_valid:d_client_input_valid;
+  assign client_weight_valid=mac_sel_attn?a_client_weight_valid:d_client_weight_valid;
+  always_comb for(int lane=0;lane<32;lane=lane+1)begin
+    client_input_vector[lane]=mac_sel_attn?a_input[lane]:d_input[lane];
+    client_weight_row_values[lane]=mac_sel_attn?a_weight[lane]:d_weight[lane];
+  end
+
+  // ------------------------- Residual datapath ------------------------------
+  logic [31:0] r1_am_q,r1_bm_q,r2_am_q,r2_bm_q;
+  logic signed [15:0] r1_as_q,r1_bs_q,r2_as_q,r2_bs_q;
+
+  // Dense output can arrive every cycle, while one shared 16-lane unit needs
+  // low/high issue cycles. A BRAM FIFO decouples the burst without dropping
+  // any projection or FC2 result. Maximum burst is 256 tokens x 4 tiles.
+  localparam int RES_FIFO_DEPTH=1024;
+  localparam int RES_FIFO_AW=10;
+  localparam int RES_JOB_W=271; // {mode_r2,pixel[11:0],co[1:0],dense[255:0]}
+  (* ram_style="block", ram_decomp="power" *)
+  logic [RES_JOB_W-1:0] res_fifo_mem[0:RES_FIFO_DEPTH-1];
+  logic [RES_FIFO_AW-1:0] res_fifo_wr_q,res_fifo_rd_q;
+  logic [RES_FIFO_AW:0] res_fifo_count_q;
+  logic [RES_JOB_W-1:0] res_fifo_rd_data_q;
+  logic res_fifo_clear,res_fifo_push,res_fifo_pop;
+  logic res_push_mode_r2;
+  logic [11:0] res_push_pixel;
+  logic [1:0] res_push_co;
+
+  typedef enum logic [3:0] {
+    R_IDLE,R_FIFO_WAIT,R_MEM_REQ,R_MEM_WAIT,R_SEND_LO,R_SEND_HI,
+    R_WAIT_OUTPUT,R_WRITE
+  } rstate_t;
+  rstate_t res_st_q;
+  logic res_job_mode_r2_q;
+  logic [11:0] res_job_pixel_q;
+  logic [1:0] res_job_co_q;
+  logic signed [255:0] res_job_dense_q,res_job_branch_q,res_result_q;
+  logic res_frame_rd_req,res_frame_wr_valid;
+  logic res_pipe_in_valid,res_pipe_in_half,res_pipe_out_valid,res_pipe_out_half;
+  logic signed [127:0] res_pipe_a,res_pipe_b,res_pipe_y;
+  logic signed [1023:0] res_pipe_aa,res_pipe_bb;
+
+  always_comb begin
+    res_pipe_in_valid=(res_st_q==R_SEND_LO)||(res_st_q==R_SEND_HI);
+    res_pipe_in_half=(res_st_q==R_SEND_HI);
+    res_frame_rd_req=(res_st_q==R_MEM_REQ);
+    res_frame_wr_valid=(res_st_q==R_WRITE);
+    for(int lane=0;lane<16;lane=lane+1)begin
+      if(res_pipe_in_half) begin
+        res_pipe_a[lane*8+:8]=res_job_branch_q[(lane+16)*8+:8];
+        res_pipe_b[lane*8+:8]=res_job_dense_q[(lane+16)*8+:8];
+      end else begin
+        res_pipe_a[lane*8+:8]=res_job_branch_q[lane*8+:8];
+        res_pipe_b[lane*8+:8]=res_job_dense_q[lane*8+:8];
+      end
+    end
+  end
+
+  requant_add_16lane u_res_shared(
+    .clk,.rst_n,.in_valid(res_pipe_in_valid),.in_half(res_pipe_in_half),
+    .a_code(res_pipe_a),.b_code(res_pipe_b),
+    .a_mult(res_job_mode_r2_q?r2_am_q:r1_am_q),
+    .a_shift(res_job_mode_r2_q?r2_as_q:r1_as_q),
+    .b_mult(res_job_mode_r2_q?r2_bm_q:r1_bm_q),
+    .b_shift(res_job_mode_r2_q?r2_bs_q:r1_bs_q),
+    .out_valid(res_pipe_out_valid),.out_half(res_pipe_out_half),
+    .a_aligned(res_pipe_aa),.b_aligned(res_pipe_bb),.y_code(res_pipe_y));
+
+  // ------------------------- Main sequencer ---------------------------------
+  typedef enum logic [5:0] {
+    E_IDLE,E_LOAD_REQ,E_LOAD_WAIT,E_LOAD_WRITE,E_RP1_REQ,E_RP1_WAIT,E_RP2_REQ,E_RP2_WAIT,
+    E_WIN_READ,E_WIN_READ_WAIT,E_WIN_NORM_WAIT,E_Q_START,E_Q_WAIT,E_K_START,E_K_WAIT,
+    E_K_XPOSE_START,E_K_XPOSE_WAIT,E_V_START,E_V_WAIT,E_ATTN_START,E_ATTN_WAIT,
+    E_PROJ_START,E_PROJ_WAIT,E_PROJ_DRAIN,
+    E_NEXT_WINDOW,E_MLP_READ,E_MLP_READ_WAIT,E_MLP_NORM_WAIT,E_FC1_START,E_FC1_WAIT,
+    E_FC1_POLY_DRAIN,E_FC2_START,E_FC2_WAIT,E_FC2_RES_DRAIN,E_NEXT_PIXEL,E_NEXT_BLOCK,
+    E_STORE_REQ,E_STORE_WAIT,E_STORE_WRITE,E_FINISH
+  } estate_t;
+  estate_t st_q;
+  logic mode_p3_q;
+  logic [2:0] block_last_q;
+  logic [6:0] load_row_q,load_col_q;logic [1:0] load_co_q;
+  logic [7:0] win_row_q,win_col_q;logic [5:0] win_tok_q;logic [1:0] win_co_q;
+  logic [11:0] mlp_pixel_q;logic [1:0] mlp_co_q;
+  logic [11:0] mlp_batch_base_q;
+  logic [8:0]  mlp_batch_count_q; // 1..256
+  logic [7:0]  mlp_batch_tok_q;
+  logic [7:0]  mlp_norm_tok_q;
+  logic [6:0] proj_write_count_q;
+  logic [12:0] fc1_poly_count_q;
+  logic [10:0] fc2_write_count_q;
+  logic norm_context_mlp_q;
+  logic [5:0] norm_meta_tok_q;logic [1:0] norm_meta_co_q;
+  logic [11:0] mapped_pixel;
+  logic poly_pipe_valid_q;logic [3:0] poly_pipe_co_q;logic [7:0] poly_pipe_tok_q;
+
+  always_comb begin : DENSE_SOURCE_MEMORY_WRITES_V11
+    win_mem_wr_en=(st_q==E_WIN_NORM_WAIT)&&norm_resp_valid;
+    win_mem_wr_addr={norm_meta_tok_q[4:0],norm_meta_co_q}; win_mem_wr_data=norm_resp_packed;
+    ctx_mem_wr_en=attn_ctx_valid; ctx_mem_wr_addr={attn_ctx_token,attn_ctx_co}; ctx_mem_wr_data=attn_ctx_data;
+    norm2_mem_wr_en=(st_q==E_MLP_NORM_WAIT)&&norm_resp_valid;
+    norm2_mem_wr_addr={mlp_norm_tok_q,norm_meta_co_q}; norm2_mem_wr_data=norm_resp_packed;
+    fc1_mem_wr_en=poly_resp_valid&&poly_pipe_valid_q;
+    fc1_mem_wr_addr={poly_pipe_tok_q,poly_pipe_co_q}; fc1_mem_wr_data=poly_resp_packed;
+  end
+
+  function automatic logic [11:0] raster_pixel(input logic [6:0] row,input logic [6:0] col,input logic is_p3);
+    logic [13:0] p;
+    begin
+      if(is_p3)p=($unsigned(row)<<5)+($unsigned(row)<<4)+($unsigned(row)<<2)+$unsigned(col);
+      else p=($unsigned(row)<<4)+($unsigned(row)<<3)+($unsigned(row)<<2)+($unsigned(row)<<1)+$unsigned(col);
+      raster_pixel=p[11:0];
+    end
+  endfunction
+  function automatic logic [2:0] tok_row(input logic [5:0] tok,input logic is_p3);
+    logic [10:0] prod;logic [5:0] q;
+    begin
+      if(is_p3)q=tok>>2;
+      else begin prod=(tok<<3)+(tok<<2)+tok;q=prod>>6;end
+      tok_row=q[2:0];
+    end
+  endfunction
+  function automatic logic [2:0] tok_col(input logic [5:0] tok,input logic is_p3);
+    logic [2:0] r;begin r=tok_row(tok,is_p3);tok_col=is_p3?tok[1:0]:(tok-r*5);end
+  endfunction
+  function automatic logic [11:0] p4_store_pixel(input logic [6:0] row,input logic [6:0] col);
+    logic [12:0] p;begin p=($unsigned(row)<<4)+($unsigned(row)<<3)+($unsigned(row)<<1)+$unsigned(col);p4_store_pixel=p[11:0];end
+  endfunction
+  function automatic logic [11:0] window_pixel(input logic [7:0] wr,input logic [7:0] wc,
+    input logic [5:0] tok,input block_cfg_t c);
+    logic [7:0] y,x;logic [2:0] tr,tc;
+    begin
+      tr=tok_row(tok,c.ws==4);tc=tok_col(tok,c.ws==4);
+      y=wr*c.ws+tr+c.shift;if(y>=c.h)y=y-c.h;
+      x=wc*c.ws+tc+c.shift;if(x>=c.w)x=x-c.w;
+      window_pixel=raster_pixel(y[6:0],x[6:0],c.w==52);
+    end
+  endfunction
+
+  function automatic logic [8:0] mlp_batch_len(input logic [11:0] base,input logic [11:0] total);
+    logic [12:0] remain;
+    begin
+      remain = {1'b0,total} - {1'b0,base};
+      if (remain >= MLP_BATCH_TOKENS) mlp_batch_len = 9'd256;
+      else mlp_batch_len = remain[8:0];
+    end
+  endfunction
+
+  assign res_fifo_clear=(st_q==E_PROJ_START)||(st_q==E_FC2_START);
+  assign res_fifo_push=
+    (((st_q==E_PROJ_WAIT)||(st_q==E_PROJ_DRAIN))&&dense_out_valid&&
+     (dense_out_stage==DENSE_PROJ)) ||
+    (((st_q==E_FC2_WAIT)||(st_q==E_FC2_RES_DRAIN))&&dense_out_valid&&
+     (dense_out_stage==DENSE_FC2));
+  assign res_fifo_pop=(res_st_q==R_IDLE)&&(res_fifo_count_q!=0)&&!res_fifo_clear;
+
+  always_comb begin
+    res_push_mode_r2=(dense_out_stage==DENSE_FC2);
+    res_push_pixel=res_push_mode_r2 ?
+      (mlp_batch_base_q+dense_out_token) :
+      window_pixel(win_row_q,win_col_q,dense_out_token[5:0],cfg_q);
+    res_push_co=dense_out_co[1:0];
+  end
+
+  // BRAM write port: no reset on memory process.
+  always_ff @(posedge clk) begin
+    if (res_fifo_push && !res_fifo_clear) begin
+      res_fifo_mem[res_fifo_wr_q] <=
+        {res_push_mode_r2,res_push_pixel,res_push_co,dense_out_data};
+    end
+  end
+
+  // BRAM synchronous read port: no reset on memory process or output register.
+  always_ff @(posedge clk) begin
+    if (res_fifo_pop) begin
+      res_fifo_rd_data_q <= res_fifo_mem[res_fifo_rd_q];
+    end
+  end
+
+  // Reset only FIFO control state, never the memory array/read-data register.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      res_fifo_wr_q    <= '0;
+      res_fifo_rd_q    <= '0;
+      res_fifo_count_q <= '0;
+    end else if (res_fifo_clear) begin
+      res_fifo_wr_q    <= '0;
+      res_fifo_rd_q    <= '0;
+      res_fifo_count_q <= '0;
+    end else begin
+      if (res_fifo_push)
+        res_fifo_wr_q <= res_fifo_wr_q + 1'b1;
+
+      if (res_fifo_pop)
+        res_fifo_rd_q <= res_fifo_rd_q + 1'b1;
+
+      unique case ({res_fifo_push,res_fifo_pop})
+        2'b10: res_fifo_count_q <= res_fifo_count_q + 1'b1;
+        2'b01: res_fifo_count_q <= res_fifo_count_q - 1'b1;
+        default: ;
+      endcase
+    end
+  end
+
+  // Residual job scheduler. It waits for both half results before committing
+  // one 256-bit word to the frame store, preserving atomic output visibility.
+  logic res_low_seen_q;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if(!rst_n) begin
+      res_st_q<=R_IDLE;
+      res_job_mode_r2_q<=1'b0;
+      res_job_pixel_q<='0;
+      res_job_co_q<='0;
+      res_job_dense_q<='0;
+      res_job_branch_q<='0;
+      res_result_q<='0;
+      res_low_seen_q<=1'b0;
+    end else if(res_fifo_clear) begin
+      res_st_q<=R_IDLE;
+      res_low_seen_q<=1'b0;
+    end else begin
+      unique case(res_st_q)
+        R_IDLE: if(res_fifo_pop) res_st_q<=R_FIFO_WAIT;
+        R_FIFO_WAIT: begin
+          res_job_mode_r2_q<=res_fifo_rd_data_q[270];
+          res_job_pixel_q<=res_fifo_rd_data_q[269:258];
+          res_job_co_q<=res_fifo_rd_data_q[257:256];
+          res_job_dense_q<=res_fifo_rd_data_q[255:0];
+          res_result_q<='0;
+          res_low_seen_q<=1'b0;
+          res_st_q<=R_MEM_REQ;
+        end
+        R_MEM_REQ: res_st_q<=R_MEM_WAIT;
+        R_MEM_WAIT: begin
+          if((!res_job_mode_r2_q&&a_rd_valid)||
+             (res_job_mode_r2_q&&b_rd_valid)) begin
+            res_job_branch_q<=res_job_mode_r2_q?b_rd_data:a_rd_data;
+            res_st_q<=R_SEND_LO;
+          end
+        end
+        R_SEND_LO: res_st_q<=R_SEND_HI;
+        R_SEND_HI: res_st_q<=R_WAIT_OUTPUT;
+        R_WAIT_OUTPUT: if(res_pipe_out_valid) begin
+          if(res_pipe_out_half) begin
+            for(int lane=0;lane<16;lane=lane+1)
+              res_result_q[(lane+16)*8+:8]<=res_pipe_y[lane*8+:8];
+            res_st_q<=R_WRITE;
+          end else begin
+            for(int lane=0;lane<16;lane=lane+1)
+              res_result_q[lane*8+:8]<=res_pipe_y[lane*8+:8];
+            res_low_seen_q<=1'b1;
+          end
+        end
+        R_WRITE: res_st_q<=R_IDLE;
+        default: res_st_q<=R_IDLE;
+      endcase
+    end
+  end
+
+  always_comb begin
+    cfg_q=cfg_for(active_block);
+    engine_state=st_q;
+    p4_busy=(st_q!=E_IDLE)&&(st_q!=E_FINISH)&&!mode_p3_q;
+    p3_busy=(st_q!=E_IDLE)&&(st_q!=E_FINISH)&&mode_p3_q;
+    mapped_pixel=window_pixel(win_row_q,win_col_q,dense_out_token[5:0],cfg_q);
+
+    // Defaults for memories and asset vector requests.
+    store_rd_en=1'b0;store_sel_p3=mode_p3_q;store_rd_pixel='0;store_rd_co='0;
+    store_wr_en=1'b0;store_wr_sel_p3=mode_p3_q;store_wr_pixel='0;store_wr_co='0;store_wr_data='0;
+    a_rd_en=1'b0;a_rd_pixel='0;a_rd_co='0;a_wr_en=1'b0;a_wr_pixel='0;a_wr_co='0;a_wr_data='0;
+    b_rd_en=1'b0;b_rd_pixel='0;b_rd_co='0;b_wr_en=1'b0;b_wr_pixel='0;b_wr_co='0;b_wr_data='0;
+    norm_req_valid=1'b0;norm_req_block=active_block;norm_req_sel=1'b0;norm_req_co_tile='0;
+    poly_req_valid=1'b0;poly_req_block=active_block;
+    for(int lane=0;lane<32;lane=lane+1)begin norm_req_code[lane]='0;poly_req_code[lane]='0;end
+    resparam_req_valid=1'b0;resparam_req_block=active_block;resparam_req_sel=1'b0;
+    dense_start=1'b0;attn_start=1'b0;mac_sel_attn=1'b0;qkv_transpose_start=1'b0;
+    dense_stage_q=DENSE_Q;dense_tokens_m1_q='0;dense_ktiles_m1_q='0;dense_ntiles_m1_q='0;
+
+    case(st_q)
+      E_LOAD_REQ:begin
+        if(mode_p3_q)begin store_rd_en=1'b1;store_rd_pixel=raster_pixel(load_row_q,load_col_q,1'b1);store_rd_co=load_co_q;end
+        else if((load_row_q<26)&&(load_col_q<26))begin store_rd_en=1'b1;store_rd_pixel=p4_store_pixel(load_row_q,load_col_q);store_rd_co=load_co_q;end
+      end
+      E_LOAD_WRITE:begin
+        a_wr_en=1'b1;a_wr_pixel=raster_pixel(load_row_q,load_col_q,mode_p3_q);a_wr_co=load_co_q;
+        a_wr_data=(!mode_p3_q&&((load_row_q>=26)||(load_col_q>=26)))?'0:store_rd_data;
+      end
+      E_RP1_REQ:begin resparam_req_valid=1'b1;resparam_req_sel=1'b0;end
+      E_RP2_REQ:begin resparam_req_valid=1'b1;resparam_req_sel=1'b1;end
+      E_WIN_READ:begin a_rd_en=1'b1;a_rd_pixel=window_pixel(win_row_q,win_col_q,win_tok_q,cfg_q);a_rd_co=win_co_q;end
+      E_WIN_READ_WAIT:begin
+        norm_req_valid=a_rd_valid;norm_req_sel=1'b0;norm_req_co_tile=win_co_q;
+        for(int lane=0;lane<32;lane=lane+1)norm_req_code[lane]=a_rd_data[lane*8+:8];
+      end
+      E_Q_START:begin dense_start=1'b1;dense_stage_q=DENSE_Q;dense_tokens_m1_q=cfg_q.window_tokens-1'b1;dense_ktiles_m1_q=4'd3;dense_ntiles_m1_q=4'd3;end
+      E_K_START:begin dense_start=1'b1;dense_stage_q=DENSE_K;dense_tokens_m1_q=cfg_q.window_tokens-1'b1;dense_ktiles_m1_q=4'd3;dense_ntiles_m1_q=4'd3;end
+      E_K_XPOSE_START:qkv_transpose_start=1'b1;
+      E_V_START:begin dense_start=1'b1;dense_stage_q=DENSE_V;dense_tokens_m1_q=cfg_q.window_tokens-1'b1;dense_ktiles_m1_q=4'd3;dense_ntiles_m1_q=4'd3;end
+      E_ATTN_START:begin attn_start=1'b1;mac_sel_attn=1'b1;end
+      E_ATTN_WAIT:mac_sel_attn=1'b1;
+      E_PROJ_START:begin dense_start=1'b1;dense_stage_q=DENSE_PROJ;dense_tokens_m1_q=cfg_q.window_tokens-1'b1;dense_ktiles_m1_q=4'd3;dense_ntiles_m1_q=4'd3;end
+      E_PROJ_WAIT,E_PROJ_DRAIN:begin
+        dense_stage_q = DENSE_PROJ; // V65_PHASE_A_V2 PROJ
+        if(res_frame_rd_req&&!res_job_mode_r2_q) begin
+          a_rd_en=1'b1;a_rd_pixel=res_job_pixel_q;a_rd_co=res_job_co_q;
+        end
+        if(res_frame_wr_valid&&!res_job_mode_r2_q) begin
+          b_wr_en=1'b1;b_wr_pixel=res_job_pixel_q;b_wr_co=res_job_co_q;b_wr_data=res_result_q;
+        end
+      end
+      E_MLP_READ:begin b_rd_en=1'b1;b_rd_pixel=mlp_batch_base_q+mlp_batch_tok_q;b_rd_co=mlp_co_q;end
+      E_MLP_READ_WAIT:begin
+        norm_req_valid=b_rd_valid;norm_req_sel=1'b1;norm_req_co_tile=mlp_co_q;
+        for(int lane=0;lane<32;lane=lane+1)norm_req_code[lane]=b_rd_data[lane*8+:8];
+      end
+      E_FC1_START:begin dense_start=1'b1;dense_stage_q=DENSE_FC1;dense_tokens_m1_q=mlp_batch_count_q-1'b1;dense_ktiles_m1_q=4'd3;dense_ntiles_m1_q=4'd15;end
+      E_FC1_WAIT,E_FC1_POLY_DRAIN:begin
+        dense_stage_q = DENSE_FC1; // V65_PHASE_A_V2 FC1
+        if(dense_out_valid&&(dense_out_stage==DENSE_FC1))begin
+          poly_req_valid=1'b1;for(int lane=0;lane<32;lane=lane+1)poly_req_code[lane]=dense_out_data[lane*8+:8];
+        end
+      end
+      E_FC2_START:begin dense_start=1'b1;dense_stage_q=DENSE_FC2;dense_tokens_m1_q=mlp_batch_count_q-1'b1;dense_ktiles_m1_q=4'd15;dense_ntiles_m1_q=4'd3;end
+      E_FC2_WAIT,E_FC2_RES_DRAIN:begin
+        dense_stage_q = DENSE_FC2; // V65_PHASE_A_V2 FC2
+        if(res_frame_rd_req&&res_job_mode_r2_q) begin
+          b_rd_en=1'b1;b_rd_pixel=res_job_pixel_q;b_rd_co=res_job_co_q;
+        end
+        if(res_frame_wr_valid&&res_job_mode_r2_q) begin
+          a_wr_en=1'b1;a_wr_pixel=res_job_pixel_q;a_wr_co=res_job_co_q;a_wr_data=res_result_q;
+        end
+      end
+      E_STORE_REQ:begin a_rd_en=1'b1;a_rd_co=load_co_q;
+        a_rd_pixel=mode_p3_q?raster_pixel(load_row_q,load_col_q,1'b1):raster_pixel(load_row_q,load_col_q,1'b0);
+      end
+      E_STORE_WRITE:begin store_wr_en=1'b1;store_wr_sel_p3=mode_p3_q;store_wr_co=load_co_q;
+        store_wr_pixel=mode_p3_q?raster_pixel(load_row_q,load_col_q,1'b1):p4_store_pixel(load_row_q,load_col_q);
+        store_wr_data=a_rd_data;
+      end
+      default:;
+    endcase
+  end
+
+  // One-cycle metadata pipeline for PolySiLU responses.
+  always_ff @(posedge clk or negedge rst_n) begin
+    if(!rst_n)begin
+      poly_pipe_valid_q<=1'b0;poly_pipe_co_q<='0;poly_pipe_tok_q<='0;
+    end else begin
+      poly_pipe_valid_q<=poly_req_valid;
+      if(poly_req_valid)begin poly_pipe_co_q<=dense_out_co;poly_pipe_tok_q<=dense_out_token[7:0];end
+    end
+  end
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if(!rst_n)begin
+      st_q<=E_IDLE;active_block<=BLK_P4_0;mode_p3_q<=1'b0;block_last_q<=BLK_P4_3;
+      p4_done<=1'b0;p3_done<=1'b0;load_row_q<='0;load_col_q<='0;load_co_q<='0;
+      win_row_q<='0;win_col_q<='0;win_tok_q<='0;win_co_q<='0;mlp_pixel_q<='0;mlp_co_q<='0;
+      mlp_batch_base_q<='0;mlp_batch_count_q<=9'd256;mlp_batch_tok_q<='0;mlp_norm_tok_q<='0;
+      proj_write_count_q<='0;fc1_poly_count_q<='0;fc2_write_count_q<='0;norm_context_mlp_q<=1'b0;
+      norm_meta_tok_q<='0;norm_meta_co_q<='0;r1_am_q<='0;r1_as_q<='0;r1_bm_q<='0;r1_bs_q<='0;
+      r2_am_q<='0;r2_as_q<='0;r2_bm_q<='0;r2_bs_q<='0;block_cycle_count<='0;
+    end else begin
+      p4_done<=1'b0;p3_done<=1'b0;
+      if(st_q!=E_IDLE&&st_q!=E_FINISH)block_cycle_count<=block_cycle_count+1'b1;
+      else if(st_q==E_IDLE)block_cycle_count<='0;
+
+`ifndef SYNTHESIS
+      if(attn_ctx_valid)ctx_local[{attn_ctx_token,attn_ctx_co}]<=attn_ctx_data;
+`endif
+      if(poly_resp_valid&&poly_pipe_valid_q)begin
+`ifndef SYNTHESIS
+        fc1_batch[{poly_pipe_tok_q,poly_pipe_co_q}]<=poly_resp_packed;
+`endif
+        fc1_poly_count_q<=fc1_poly_count_q+1'b1;
+      end
+      if(res_frame_wr_valid) begin
+        if(res_job_mode_r2_q) fc2_write_count_q<=fc2_write_count_q+1'b1;
+        else                 proj_write_count_q<=proj_write_count_q+1'b1;
+      end
+
+      case(st_q)
+        E_IDLE:begin
+          if(p4_start)begin mode_p3_q<=1'b0;active_block<=BLK_P4_0;block_last_q<=BLK_P4_3;load_row_q<='0;load_col_q<='0;load_co_q<='0;st_q<=E_LOAD_REQ;end
+          else if(p3_start)begin mode_p3_q<=1'b1;active_block<=BLK_P3_0;block_last_q<=BLK_P3_1;load_row_q<='0;load_col_q<='0;load_co_q<='0;st_q<=E_LOAD_REQ;end
+        end
+        E_LOAD_REQ:begin
+          if(!mode_p3_q&&((load_row_q>=26)||(load_col_q>=26)))st_q<=E_LOAD_WRITE;
+          else st_q<=E_LOAD_WAIT;
+        end
+        E_LOAD_WAIT:if(store_rd_valid)st_q<=E_LOAD_WRITE;
+        E_LOAD_WRITE:begin
+          if(load_co_q==3)begin load_co_q<='0;if(load_col_q==(mode_p3_q?51:29))begin load_col_q<='0;if(load_row_q==(mode_p3_q?51:29))st_q<=E_RP1_REQ;else begin load_row_q<=load_row_q+1'b1;st_q<=E_LOAD_REQ;end end else begin load_col_q<=load_col_q+1'b1;st_q<=E_LOAD_REQ;end end
+          else begin load_co_q<=load_co_q+1'b1;st_q<=E_LOAD_REQ;end
+        end
+        E_RP1_REQ:st_q<=E_RP1_WAIT;
+        E_RP1_WAIT:if(resparam_resp_valid)begin r1_am_q<=resparam_a_mult;r1_as_q<=resparam_a_shift;r1_bm_q<=resparam_b_mult;r1_bs_q<=resparam_b_shift;st_q<=E_RP2_REQ;end
+        E_RP2_REQ:st_q<=E_RP2_WAIT;
+        E_RP2_WAIT:if(resparam_resp_valid)begin r2_am_q<=resparam_a_mult;r2_as_q<=resparam_a_shift;r2_bm_q<=resparam_b_mult;r2_bs_q<=resparam_b_shift;win_row_q<='0;win_col_q<='0;win_tok_q<='0;win_co_q<='0;st_q<=E_WIN_READ;end
+        E_WIN_READ:st_q<=E_WIN_READ_WAIT;
+        E_WIN_READ_WAIT:if(a_rd_valid)begin norm_context_mlp_q<=1'b0;norm_meta_tok_q<=win_tok_q;norm_meta_co_q<=win_co_q;st_q<=E_WIN_NORM_WAIT;end
+        E_WIN_NORM_WAIT:if(norm_resp_valid)begin
+`ifndef SYNTHESIS
+          win_x[{norm_meta_tok_q[4:0],norm_meta_co_q}]<=norm_resp_packed;
+`endif
+          if(win_co_q==3)begin win_co_q<='0;if(win_tok_q==cfg_q.window_tokens-1'b1)st_q<=E_Q_START;else begin win_tok_q<=win_tok_q+1'b1;st_q<=E_WIN_READ;end end
+          else begin win_co_q<=win_co_q+1'b1;st_q<=E_WIN_READ;end
+        end
+        E_Q_START:st_q<=E_Q_WAIT;E_Q_WAIT:if(dense_done)st_q<=E_K_START;
+        E_K_START:st_q<=E_K_WAIT;
+        E_K_WAIT:if(dense_done)st_q<=E_K_XPOSE_START;
+        E_K_XPOSE_START:st_q<=E_K_XPOSE_WAIT;
+        E_K_XPOSE_WAIT:if(qkv_transpose_done)st_q<=E_V_START;
+        E_V_START:st_q<=E_V_WAIT;E_V_WAIT:if(dense_done)st_q<=E_ATTN_START;
+        E_ATTN_START:st_q<=E_ATTN_WAIT;E_ATTN_WAIT:if(attn_done)begin proj_write_count_q<='0;st_q<=E_PROJ_START;end
+        E_PROJ_START:st_q<=E_PROJ_WAIT;
+        E_PROJ_WAIT:if(dense_done)st_q<=E_PROJ_DRAIN;
+        E_PROJ_DRAIN:if(proj_write_count_q==cfg_q.window_tokens*4)st_q<=E_NEXT_WINDOW;
+        E_NEXT_WINDOW:begin
+          win_tok_q<='0;win_co_q<='0;
+          if(win_col_q==(mode_p3_q?8'd12:8'd5))begin win_col_q<='0;if(win_row_q==(mode_p3_q?8'd12:8'd5))begin mlp_pixel_q<='0;mlp_co_q<='0;mlp_batch_base_q<='0;mlp_batch_tok_q<='0;mlp_batch_count_q<=mlp_batch_len(12'd0,cfg_q.pixels);st_q<=E_MLP_READ;end else begin win_row_q<=win_row_q+1'b1;st_q<=E_WIN_READ;end end
+          else begin win_col_q<=win_col_q+1'b1;st_q<=E_WIN_READ;end
+        end
+        E_MLP_READ:st_q<=E_MLP_READ_WAIT;
+        E_MLP_READ_WAIT:if(b_rd_valid)begin norm_context_mlp_q<=1'b1;norm_meta_co_q<=mlp_co_q;mlp_norm_tok_q<=mlp_batch_tok_q;st_q<=E_MLP_NORM_WAIT;end
+        E_MLP_NORM_WAIT:if(norm_resp_valid)begin
+`ifndef SYNTHESIS
+          norm2_batch[{mlp_norm_tok_q,norm_meta_co_q}]<=norm_resp_packed;
+`endif
+          if(mlp_co_q==3)begin
+            mlp_co_q<='0;
+            if(mlp_batch_tok_q==mlp_batch_count_q-1'b1)begin mlp_batch_tok_q<='0;fc1_poly_count_q<='0;st_q<=E_FC1_START;end
+            else begin mlp_batch_tok_q<=mlp_batch_tok_q+1'b1;st_q<=E_MLP_READ;end
+          end else begin mlp_co_q<=mlp_co_q+1'b1;st_q<=E_MLP_READ;end
+        end
+        E_FC1_START:st_q<=E_FC1_WAIT;
+        E_FC1_WAIT:if(dense_done)st_q<=E_FC1_POLY_DRAIN;
+        E_FC1_POLY_DRAIN:if(fc1_poly_count_q==({4'b0,mlp_batch_count_q}<<4))begin fc2_write_count_q<='0;st_q<=E_FC2_START;end
+        E_FC2_START:st_q<=E_FC2_WAIT;
+        E_FC2_WAIT:if(dense_done)st_q<=E_FC2_RES_DRAIN;
+        E_FC2_RES_DRAIN:if(fc2_write_count_q==({2'b0,mlp_batch_count_q}<<2))st_q<=E_NEXT_PIXEL;
+        E_NEXT_PIXEL:begin
+          if((mlp_batch_base_q+mlp_batch_count_q)>=cfg_q.pixels)st_q<=E_NEXT_BLOCK;
+          else begin
+            mlp_batch_base_q<=mlp_batch_base_q+mlp_batch_count_q;
+            mlp_batch_count_q<=mlp_batch_len(mlp_batch_base_q+mlp_batch_count_q,cfg_q.pixels);
+            mlp_batch_tok_q<='0;mlp_co_q<='0;st_q<=E_MLP_READ;
+          end
+        end
+        E_NEXT_BLOCK:begin
+          if(active_block==block_last_q)begin load_row_q<='0;load_col_q<='0;load_co_q<='0;st_q<=E_STORE_REQ;end
+          else begin active_block<=active_block+1'b1;st_q<=E_RP1_REQ;end
+        end
+        E_STORE_REQ:st_q<=E_STORE_WAIT;
+        E_STORE_WAIT:if(a_rd_valid)st_q<=E_STORE_WRITE;
+        E_STORE_WRITE:begin
+          if(load_co_q==3)begin load_co_q<='0;if(load_col_q==(mode_p3_q?51:25))begin load_col_q<='0;if(load_row_q==(mode_p3_q?51:25))st_q<=E_FINISH;else begin load_row_q<=load_row_q+1'b1;st_q<=E_STORE_REQ;end end else begin load_col_q<=load_col_q+1'b1;st_q<=E_STORE_REQ;end end
+          else begin load_co_q<=load_co_q+1'b1;st_q<=E_STORE_REQ;end
+        end
+        E_FINISH:begin if(mode_p3_q)p3_done<=1'b1;else p4_done<=1'b1;st_q<=E_IDLE;end
+        default:st_q<=E_IDLE;
+      endcase
+    end
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) begin
+    if(rst_n&&dense_busy&&attn_busy)$fatal(1,"single Swin engine launched dense and attention simultaneously");
+    if(rst_n&&res_fifo_push&&!res_fifo_pop&&
+       (res_fifo_count_q==RES_FIFO_DEPTH))
+      $fatal(1,"single Swin engine residual FIFO overflow");
+    if(rst_n&&res_pipe_out_valid&&res_pipe_out_half&&!res_low_seen_q)
+      $fatal(1,"single Swin engine residual high half arrived before low half");
+  end
+  always_ff @(posedge clk) begin
+    if (rst_n && norm_resp_valid && !norm_context_mlp_q && (norm_meta_tok_q > 6'd24))
+      $fatal(1,"single Swin engine norm token out of local-window range: tok=%0d", norm_meta_tok_q);
+    if (rst_n && (mlp_batch_count_q == 0 || mlp_batch_count_q > MLP_BATCH_TOKENS))
+      $fatal(1,"30fps MLP batch count out of range: %0d",mlp_batch_count_q);
+  end
+`endif
+endmodule

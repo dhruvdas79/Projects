@@ -1,0 +1,41 @@
+// ============================================================================
+// psum_banked_mem.sv
+// Vivado synthesis-safe banked partial-sum memory.
+// ============================================================================
+`timescale 1ns/1ps
+
+module psum_banked_mem #(
+    parameter int DEPTH  = 2704,
+    parameter int PE_N   = 16,
+    parameter int ACC_W  = 64,
+    parameter int ADDR_W = $clog2(DEPTH)
+) (
+    input  logic                         clk,
+
+    input  logic                         rd_en,
+    input  logic [ADDR_W-1:0]            rd_addr,
+    output logic signed [ACC_W-1:0]      rd_data [0:PE_N-1],
+
+    input  logic                         wr_en,
+    input  logic [ADDR_W-1:0]            wr_addr,
+    input  logic signed [ACC_W-1:0]      wr_data [0:PE_N-1]
+);
+
+    genvar lane;
+    generate
+        for (lane = 0; lane < PE_N; lane = lane + 1) begin : G_PSUM_BANK
+            (* ram_style = "block" *)
+            logic signed [ACC_W-1:0] mem_bank [0:DEPTH-1];
+
+            always_ff @(posedge clk) begin
+                if (wr_en) begin
+                    mem_bank[wr_addr] <= wr_data[lane];
+                end
+                if (rd_en) begin
+                    rd_data[lane] <= mem_bank[rd_addr];
+                end
+            end
+        end
+    endgenerate
+
+endmodule

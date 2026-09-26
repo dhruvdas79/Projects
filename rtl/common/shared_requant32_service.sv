@@ -1,0 +1,124 @@
+`timescale 1ns/1ps
+// ============================================================================
+// One globally shared 32-lane requantization service.
+// All dense/QKV/projection clients feed this service after the one shared MAC.
+// The route tag returns each result to the originating client.
+// ============================================================================
+(* use_dsp = "no" *)
+module shared_requant32_service #(
+    parameter int LANES   = 32,
+    parameter int ROUTE_W = 6,
+    parameter int LATENCY = 7
+)(
+    input  logic clk,
+    input  logic rst_n,
+
+    input  logic                         in_valid,
+    input  logic [ROUTE_W-1:0]           in_route,
+    input  logic [1:0]                   in_op,
+    input  logic [1:0]                   in_layer,
+    input  logic [11:0]                  in_token,
+    input  logic [6:0]                   in_co,
+    input  logic signed [63:0]           in_value      [0:LANES-1],
+    input  logic signed [31:0]           in_multiplier [0:LANES-1],
+    input  logic signed [15:0]           in_shift      [0:LANES-1],
+
+    output logic                         out_valid,
+    output logic [ROUTE_W-1:0]           out_route,
+    output logic [1:0]                   out_op,
+    output logic [1:0]                   out_layer,
+    output logic [11:0]                  out_token,
+    output logic [6:0]                   out_co,
+    output logic signed [7:0]            out_code       [0:LANES-1]
+);
+    logic req_valid;
+    logic signed [7:0] req_code [0:LANES-1];
+
+    // requant_s8_shiftadd_pipe is a fixed seven-stage arithmetic pipeline.
+    // Keep the metadata delay explicitly tied to that qualified latency.
+    localparam int REQUANT_PIPE_LATENCY = 7;
+
+    logic [ROUTE_W-1:0] route_pipe [0:LATENCY-1];
+    logic [1:0] op_pipe [0:LATENCY-1];
+    logic [1:0] layer_pipe [0:LATENCY-1];
+    logic [11:0] token_pipe [0:LATENCY-1];
+    logic [6:0] co_pipe [0:LATENCY-1];
+    logic meta_valid [0:LATENCY-1];
+
+
+    requant_s8_shiftadd_pipe #(.LANES(LANES)) u_only_global_requant_pipe (
+        .clk(clk),
+        .rst_n(rst_n),
+        .in_valid(in_valid),
+        .in_value(in_value),
+        .in_multiplier(in_multiplier),
+        .in_shift(in_shift),
+        .out_valid(req_valid),
+        .out_code(req_code)
+    );
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            for (int s =0; s<LATENCY; s=s+1) begin
+                meta_valid[s] <= 1'b0;
+                route_pipe[s] <= '0;
+                op_pipe[s] <= '0;
+                layer_pipe[s] <= '0;
+                token_pipe[s] <= '0;
+                co_pipe[s] <= '0;
+            end
+            out_valid <= 1'b0;
+            out_route <= '0;
+            out_op <= '0;
+            out_layer <= '0;
+            out_token <= '0;
+            out_co <= '0;
+            for (int lane_reset =0; lane_reset<LANES; lane_reset=lane_reset+1)
+                out_code[lane_reset] <= '0;
+        end else begin
+            meta_valid[0] <= in_valid;
+            if (in_valid) begin
+                route_pipe[0] <= in_route;
+                op_pipe[0] <= in_op;
+                layer_pipe[0] <= in_layer;
+                token_pipe[0] <= in_token;
+                co_pipe[0] <= in_co;
+            end
+            for (int s =1; s<LATENCY; s=s+1) begin
+                meta_valid[s] <= meta_valid[s-1];
+                if (meta_valid[s-1]) begin
+                    route_pipe[s] <= route_pipe[s-1];
+                    op_pipe[s] <= op_pipe[s-1];
+                    layer_pipe[s] <= layer_pipe[s-1];
+                    token_pipe[s] <= token_pipe[s-1];
+                    co_pipe[s] <= co_pipe[s-1];
+                end
+            end
+
+            out_valid <= req_valid;
+            if (req_valid) begin
+                out_route <= route_pipe[LATENCY-1];
+                out_op <= op_pipe[LATENCY-1];
+                out_layer <= layer_pipe[LATENCY-1];
+                out_token <= token_pipe[LATENCY-1];
+                out_co <= co_pipe[LATENCY-1];
+                for (int lane_reset =0; lane_reset<LANES; lane_reset=lane_reset+1)
+                    out_code[lane_reset] <= req_code[lane_reset];
+            end
+        end
+    end
+
+`ifndef SYNTHESIS
+    initial begin
+        if (LATENCY != REQUANT_PIPE_LATENCY)
+            $fatal(1,
+                "shared_requant32_service LATENCY=%0d must match requant pipeline latency=%0d",
+                LATENCY, REQUANT_PIPE_LATENCY);
+    end
+
+    always_ff @(posedge clk) begin
+        if (rst_n && (req_valid !== meta_valid[LATENCY-1]))
+            $fatal(1, "shared_requant32_service metadata/data misalignment");
+    end
+`endif
+endmodule

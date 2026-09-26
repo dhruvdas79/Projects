@@ -1,0 +1,179 @@
+`timescale 1ns/1ps
+// ============================================================================
+// Shared 32-lane attention scaler for QK and P*V raw vectors.
+//
+// The MAC service returns sign-extended 48-bit accumulators. Each 48x32 signed
+// product is decomposed into four DSP48-friendly partial products:
+//   x = x_lo_u24 + (x_hi_s24 << 24)
+//   m = m_lo_u16 + (m_hi_s16 << 16)
+// The 80-bit sum is truncated to 64 bits exactly like fixedpoint_pkg's longint
+// multiplication, followed by the same strict rounding and INT8 saturation.
+// ============================================================================
+(* use_dsp = "yes" *)
+module swin_attention_scale32_dsp #(
+  parameter int LANES=32
+)(
+  input  logic clk,
+  input  logic rst_n,
+  input  logic in_valid,
+  input  logic in_is_qk,
+  input  logic [2:0] in_head,
+  input  logic [4:0] in_query,
+  input  logic [1:0] in_co,
+  input  logic signed [LANES*64-1:0] in_acc,
+  input  logic signed [LANES*16-1:0] in_bias,
+  input  logic signed [31:0] in_mult,
+  input  logic [5:0] in_shift,
+  output logic out_valid,
+  output logic out_is_qk,
+  output logic [2:0] out_head,
+  output logic [4:0] out_query,
+  output logic [1:0] out_co,
+  output logic signed [LANES*8-1:0] out_code
+);
+  logic s1_valid_q,s1_is_qk_q;
+  logic s2_valid_q,s2_is_qk_q;
+  logic s3_valid_q,s3_is_qk_q;
+  logic [2:0] s1_head_q,s2_head_q,s3_head_q;
+  logic [4:0] s1_query_q,s2_query_q,s3_query_q;
+  logic [1:0] s1_co_q,s2_co_q,s3_co_q;
+  logic [5:0] s1_shift_q,s2_shift_q;
+  logic signed [LANES*16-1:0] s1_bias_q,s2_bias_q,s3_bias_q;
+
+  (* use_dsp = "yes" *) logic signed [40:0] s1_p00_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [40:0] s1_p01_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [40:0] s1_p10_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [39:0] s1_p11_q[0:LANES-1];
+  logic signed [63:0] s2_product_q[0:LANES-1];
+  logic signed [63:0] s3_aligned_q[0:LANES-1];
+
+  function automatic logic signed [40:0] mul_u24_u16(
+    input logic [23:0] x,input logic [15:0] m
+  );
+    logic signed [24:0] xs;
+    logic signed [16:0] ms;
+    begin xs={1'b0,x};ms={1'b0,m};mul_u24_u16=xs*ms;end
+  endfunction
+
+  function automatic logic signed [40:0] mul_u24_s16(
+    input logic [23:0] x,input logic signed [15:0] m
+  );
+    logic signed [24:0] xs;
+    begin xs={1'b0,x};mul_u24_s16=xs*m;end
+  endfunction
+
+  function automatic logic signed [40:0] mul_s24_u16(
+    input logic signed [23:0] x,input logic [15:0] m
+  );
+    logic signed [16:0] ms;
+    begin ms={1'b0,m};mul_s24_u16=x*ms;end
+  endfunction
+
+  function automatic logic signed [39:0] mul_s24_s16(
+    input logic signed [23:0] x,input logic signed [15:0] m
+  );
+    begin mul_s24_s16=x*m;end
+  endfunction
+
+  function automatic logic signed [63:0] combine_product64(
+    input logic signed [40:0] p00,
+    input logic signed [40:0] p01,
+    input logic signed [40:0] p10,
+    input logic signed [39:0] p11
+  );
+    logic signed [79:0] t00,t01,t10,t11,sum0,sum1,total;
+    begin
+      t00={{39{p00[40]}},p00};
+      t01={{39{p01[40]}},p01}<<<16;
+      t10={{39{p10[40]}},p10}<<<24;
+      t11={{40{p11[39]}},p11}<<<40;
+      sum0=t00+t01;
+      sum1=t10+t11;
+      total=sum0+sum1;
+      combine_product64=total[63:0];
+    end
+  endfunction
+
+  always_ff @(posedge clk) begin
+    if(!rst_n) begin
+      s1_valid_q<=1'b0;
+      s2_valid_q<=1'b0;
+      s3_valid_q<=1'b0;
+      out_valid<=1'b0;
+      out_is_qk<=1'b0;
+      out_head<='0;
+      out_query<='0;
+      out_co<='0;
+    end else begin
+      s1_valid_q<=in_valid;
+      s1_is_qk_q<=in_is_qk;
+      if(in_valid) begin
+        s1_head_q<=in_head;
+        s1_query_q<=in_query;
+        s1_co_q<=in_co;
+        s1_shift_q<=in_shift;
+        s1_bias_q<=in_bias;
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          s1_p00_q[lane]<=mul_u24_u16(
+            in_acc[lane*64+:24],in_mult[15:0]);
+          s1_p01_q[lane]<=mul_u24_s16(
+            in_acc[lane*64+:24],$signed(in_mult[31:16]));
+          s1_p10_q[lane]<=mul_s24_u16(
+            $signed(in_acc[lane*64+24+:24]),in_mult[15:0]);
+          s1_p11_q[lane]<=mul_s24_s16(
+            $signed(in_acc[lane*64+24+:24]),$signed(in_mult[31:16]));
+        end
+      end
+
+      s2_valid_q<=s1_valid_q;
+      s2_is_qk_q<=s1_is_qk_q;
+      if(s1_valid_q) begin
+        s2_head_q<=s1_head_q;
+        s2_query_q<=s1_query_q;
+        s2_co_q<=s1_co_q;
+        s2_shift_q<=s1_shift_q;
+        s2_bias_q<=s1_bias_q;
+        for(int lane=0;lane<LANES;lane=lane+1)
+          s2_product_q[lane]<=combine_product64(
+            s1_p00_q[lane],s1_p01_q[lane],s1_p10_q[lane],s1_p11_q[lane]);
+      end
+
+      s3_valid_q<=s2_valid_q;
+      s3_is_qk_q<=s2_is_qk_q;
+      if(s2_valid_q) begin
+        s3_head_q<=s2_head_q;
+        s3_query_q<=s2_query_q;
+        s3_co_q<=s2_co_q;
+        s3_bias_q<=s2_bias_q;
+        for(int lane=0;lane<LANES;lane=lane+1)
+          s3_aligned_q[lane]<=fixedpoint_pkg::round_shift_i64(
+            s2_product_q[lane],$signed({1'b0,s2_shift_q}));
+      end
+
+      out_valid<=s3_valid_q;
+      out_is_qk<=s3_is_qk_q;
+      if(s3_valid_q) begin
+        out_head<=s3_head_q;
+        out_query<=s3_query_q;
+        out_co<=s3_co_q;
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          if(s3_is_qk_q)
+            out_code[lane*8+:8]<=fixedpoint_pkg::sat_s8(
+              s3_aligned_q[lane]+$signed(s3_bias_q[lane*16+:16]));
+          else
+            out_code[lane*8+:8]<=fixedpoint_pkg::sat_s8(s3_aligned_q[lane]);
+        end
+      end
+    end
+  end
+
+`ifndef SYNTHESIS
+  always_ff @(posedge clk) begin
+    if(rst_n&&in_valid) begin
+      for(int lane=0;lane<LANES;lane=lane+1)
+        if(in_acc[lane*64+63-:16]!={16{in_acc[lane*64+47]}})
+          $fatal(1,"attention scaler accumulator is not sign-extended 48-bit");
+    end
+  end
+`endif
+endmodule

@@ -1,0 +1,139 @@
+`timescale 1ns/1ps
+// ============================================================================
+// Shared 16-lane DSP-pipelined residual align-and-add.
+//
+// One 32-lane word is processed as low/high halves on consecutive input cycles.
+// Each signed-INT8 by unsigned-32 multiply is split into two exact 8x16 partial
+// products.  This fits DSP48 input widths and preserves the original unsigned
+// multiplier semantics for the full 0..2^32-1 range.
+// ============================================================================
+(* use_dsp = "yes" *)
+module requant_add_16lane #(
+  parameter int LANES = 16
+)(
+  input  logic clk,
+  input  logic rst_n,
+  input  logic in_valid,
+  input  logic in_half,
+  input  logic signed [LANES*8-1:0] a_code,
+  input  logic signed [LANES*8-1:0] b_code,
+  input  logic        [31:0] a_mult,
+  input  logic signed [15:0] a_shift,
+  input  logic        [31:0] b_mult,
+  input  logic signed [15:0] b_shift,
+  output logic out_valid,
+  output logic out_half,
+  output logic signed [LANES*64-1:0] a_aligned,
+  output logic signed [LANES*64-1:0] b_aligned,
+  output logic signed [LANES*8-1:0] y_code
+);
+  import fixedpoint_pkg::*;
+
+  logic s1_valid_q,s1_half_q;
+  logic s2_valid_q,s2_half_q;
+  logic s3_valid_q,s3_half_q;
+  logic signed [15:0] s1_a_shift_q,s1_b_shift_q;
+  logic signed [15:0] s2_a_shift_q,s2_b_shift_q;
+
+  (* use_dsp = "yes" *) logic signed [24:0] s1_a_lo_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [24:0] s1_a_hi_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [24:0] s1_b_lo_q[0:LANES-1];
+  (* use_dsp = "yes" *) logic signed [24:0] s1_b_hi_q[0:LANES-1];
+  logic signed [40:0] s2_a_product_q[0:LANES-1];
+  logic signed [40:0] s2_b_product_q[0:LANES-1];
+  logic signed [63:0] s3_a_aligned_q[0:LANES-1];
+  logic signed [63:0] s3_b_aligned_q[0:LANES-1];
+
+  function automatic logic signed [24:0] mul_s8_u16_dsp(
+    input logic signed [7:0] x,
+    input logic [15:0] m
+  );
+    logic signed [16:0] m_pos;
+    begin
+      m_pos={1'b0,m};
+      mul_s8_u16_dsp=$signed(x)*m_pos;
+    end
+  endfunction
+
+  function automatic logic signed [40:0] join_u32_product(
+    input logic signed [24:0] lo_product,
+    input logic signed [24:0] hi_product
+  );
+    logic signed [40:0] lo_ext;
+    logic signed [40:0] hi_ext;
+    begin
+      lo_ext={{16{lo_product[24]}},lo_product};
+      hi_ext={{16{hi_product[24]}},hi_product};
+      join_u32_product=lo_ext+(hi_ext<<<16);
+    end
+  endfunction
+
+  always_ff @(posedge clk) begin
+    if(!rst_n) begin
+      s1_valid_q<=1'b0;
+      s2_valid_q<=1'b0;
+      s3_valid_q<=1'b0;
+      out_valid<=1'b0;
+      out_half<=1'b0;
+    end else begin
+      // Stage 1: four DSP-friendly partial products per lane.
+      s1_valid_q<=in_valid;
+      s1_half_q<=in_half;
+      if(in_valid) begin
+        s1_a_shift_q<=a_shift;
+        s1_b_shift_q<=b_shift;
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          s1_a_lo_q[lane]<=mul_s8_u16_dsp($signed(a_code[lane*8+:8]),a_mult[15:0]);
+          s1_a_hi_q[lane]<=mul_s8_u16_dsp($signed(a_code[lane*8+:8]),a_mult[31:16]);
+          s1_b_lo_q[lane]<=mul_s8_u16_dsp($signed(b_code[lane*8+:8]),b_mult[15:0]);
+          s1_b_hi_q[lane]<=mul_s8_u16_dsp($signed(b_code[lane*8+:8]),b_mult[31:16]);
+        end
+      end
+
+      // Stage 2: reconstruct the exact signed-INT8 by unsigned-32 products.
+      s2_valid_q<=s1_valid_q;
+      s2_half_q<=s1_half_q;
+      if(s1_valid_q) begin
+        s2_a_shift_q<=s1_a_shift_q;
+        s2_b_shift_q<=s1_b_shift_q;
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          s2_a_product_q[lane]<=join_u32_product(s1_a_lo_q[lane],s1_a_hi_q[lane]);
+          s2_b_product_q[lane]<=join_u32_product(s1_b_lo_q[lane],s1_b_hi_q[lane]);
+        end
+      end
+
+      // Stage 3: strict signed nearest rounding, unchanged from the baseline.
+      s3_valid_q<=s2_valid_q;
+      s3_half_q<=s2_half_q;
+      if(s2_valid_q) begin
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          s3_a_aligned_q[lane]<=fixedpoint_pkg::round_shift_i64(
+            {{23{s2_a_product_q[lane][40]}},s2_a_product_q[lane]},
+            $signed(s2_a_shift_q));
+          s3_b_aligned_q[lane]<=fixedpoint_pkg::round_shift_i64(
+            {{23{s2_b_product_q[lane][40]}},s2_b_product_q[lane]},
+            $signed(s2_b_shift_q));
+        end
+      end
+
+      // Stage 4: align outputs and saturate the final residual sum.
+      out_valid<=s3_valid_q;
+      out_half<=s3_half_q;
+      if(s3_valid_q) begin
+        for(int lane=0;lane<LANES;lane=lane+1) begin
+          a_aligned[lane*64+:64]<=s3_a_aligned_q[lane];
+          b_aligned[lane*64+:64]<=s3_b_aligned_q[lane];
+          y_code[lane*8+:8]<=fixedpoint_pkg::sat_s8(
+            s3_a_aligned_q[lane]+s3_b_aligned_q[lane]);
+        end
+      end
+    end
+  end
+
+`ifndef SYNTHESIS
+  initial begin
+    if(LANES!=16)
+      $fatal(1,"requant_add_16lane DSP pipeline requires LANES=16");
+  end
+`endif
+endmodule
