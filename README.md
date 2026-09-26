@@ -9,7 +9,7 @@ A collection of RTL and machine-learning projects — from foundational digital-
 ## Major Projects
 
 ### 1. FPGA-Accelerated INT8 Swin Vision Transformer for Thermal Object Detection
-`/thermal`
+`/rtl`
 
 An edge-deployable thermal object detector (CNN backbone + Swin Transformer attention + YOLOX-style decoupled head), quantized to INT8 via QAT, with synthesizable Verilog RTL for the Swin-attention backbone.
 
