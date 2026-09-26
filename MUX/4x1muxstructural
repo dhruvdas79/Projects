@@ -1,0 +1,21 @@
+module mux_2x1(
+  input a,b,
+  input sel,
+  output out);
+  
+  assign out=sel?b:a;
+endmodule
+  
+module mux_4x1(
+  input  [3:0] in,
+  input [1:0]sel,
+  output   out);
+  
+  assign out=in[sel];
+
+wire x,y;
+  mux_2x1 mux01( .a(in[0]),.b(in[1]),.sel(sel[0]),.out(x));
+  mux_2x1 mux02( .a(in[2]),.b(in[3]),.sel(sel[0]),.out(y));
+  mux_2x1 mux03(.a(x),.b(y),.sel(sel[1]),.out(out));
+endmodule
+  

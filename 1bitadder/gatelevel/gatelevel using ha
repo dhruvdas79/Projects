@@ -1,0 +1,22 @@
+ module ha(input a,b,
+          output c,sum);
+  assign sum = a^b;
+  assign c = a & b;
+endmodule
+module fa( input a,b,cin,
+          output cout,sum);
+  wire s1,c1,c2;
+  ha h_1(
+    .a(a),
+    .b(b),
+    .c(c1),
+    .sum(s1)
+  );
+  ha h_2(
+    .a(s1),
+    .b(cin),
+    .c(c2),
+    .sum(sum)
+  );
+  assign cout= c1 | c2;
+endmodule

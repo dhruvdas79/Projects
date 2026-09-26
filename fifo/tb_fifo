@@ -1,0 +1,74 @@
+ module tb_fifo;
+  reg [31:0]w_data;
+  reg w_en,r_en,clk,rst;
+  wire [31:0] r_data;
+  wire full, empty;
+  integer i;
+  
+  fifo dut(.w_data(w_data),.w_en(w_en),.r_en(r_en),.clk(clk),.rst(rst),.r_data(r_data),.full(full),.empty(empty));  
+  always begin
+    #5 clk=~clk;
+  end
+  	
+  initial begin
+    clk = 0;          // Set initial value
+  rst = 1;
+  r_en = 0;
+  w_en = 0;
+  w_data = 32'd0;
+    #20;
+    rst=0;
+    w_en=1;
+    w_data=32'd1;
+    #10;
+    w_data=32'd2;
+    #10;//w_ptr at 010
+    w_en=0;
+    r_en=1;
+    #20;//empty signal high
+    r_en=0;
+    w_en=1;
+    w_data=32'd3;
+    #10;
+    w_data=32'd4;
+    #10;//w_ptr at 100
+    w_en=0;
+    r_en=1;
+    #20;//empty signal high
+    r_en=0;
+    w_en=1;
+    w_data=32'd5;
+    #10;
+    w_data=32'd6;
+    #10;
+    w_data=32'd7;
+    #10;//w_ptr at 111
+    w_data=32'd8;
+    #10;//w_ptr at 000
+    w_data=32'd9;
+    #10;
+    w_data=32'd0;
+    #10;
+    w_data=32'd1;
+    #10;//full signal high
+    w_data=32'd2;
+    #10;
+    w_en=0;
+    #20;
+  end
+  
+  always @(posedge clk) begin
+    $display("FIFO Register file value:\n");
+    for(i=0;i<8;i=i+1) begin
+      $display("| %0d | ",dut.reg_fifo[i]);
+    end
+  end
+  
+  always @(posedge clk or posedge rst) begin
+    $display("|| Write ptr:%b || Write Enable:%b || Read ptr:%b || Read Enable:%b || Input Data:%d || Ouput Data:%d || FIFO Full? : %b || FIFO Empty? : %b ||",dut.w_ptr,w_en,dut.r_ptr,r_en,w_data,r_data,full,empty);
+  end
+  
+  initial begin
+    #200 $finish;
+  end
+endmodule

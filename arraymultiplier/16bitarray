@@ -1,0 +1,19 @@
+ module array(
+  input  [15:0] a, b,
+  output [31:0] product
+);
+
+  wire [31:0] partial [15:0];
+ generate
+ genvar i;
+    for (i = 0; i < 16; i = i + 1) begin:partialsss
+     assign partial[i] = b[i] ? (a << i) : 32'b0;
+    end
+  endgenerate
+
+  assign product = partial[0] + partial[1] + partial[2] + partial[3] +
+                   partial[4] + partial[5] + partial[6] + partial[7] +
+                   partial[8] + partial[9] + partial[10] + partial[11] +
+                   partial[12] + partial[13] + partial[14] + partial[15];
+
+endmodule

@@ -1,0 +1,26 @@
+ module pipo_tb;
+  reg clk;
+  reg [3:0] in;
+  wire [3:0] out;
+
+  pipo uut(in, clk, out);
+
+  initial begin
+    clk = 0;
+    forever #5 clk = ~clk;
+  end
+
+  initial begin
+    $dumpfile("pipo.vcd");
+    $dumpvars(0, pipo_tb);
+
+    in = 4'b0000; #10;
+    in = 4'b1010; #10;
+    in = 4'b1100; #10;
+    in = 4'b1111; #10;
+    in = 4'b0011; #10;
+
+    #20;
+    $finish;
+  end
+endmodule

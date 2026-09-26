@@ -1,0 +1,24 @@
+module demux_2x1_tb;
+  reg in;
+  reg sel;
+  wire out0, out1;
+
+  demux_2x1 uut (
+    .in(in),
+    .sel(sel),
+    .out(out0),
+    .out1(out1)
+  );
+
+  initial begin
+    $dumpfile("demux_2x1.vcd");
+    $dumpvars(0, demux_2x1_tb);
+
+    in = 1'b0; sel = 1'b0; #10;
+    in = 1'b1; sel = 1'b0; #10;
+    in = 1'b0; sel = 1'b1; #10;
+    in = 1'b1; sel = 1'b1; #10;
+
+    $finish;
+  end
+endmodule

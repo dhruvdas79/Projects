@@ -1,0 +1,22 @@
+ module bcdencoder_tb;
+  reg [9:0] in;
+   wire [3:0] bcd;
+
+  bcdencoder uut (
+    .in(in),
+    .bcd(bcd)
+  );
+
+  integer i;
+  initial begin
+    $dumpfile("bcdencoder.vcd");
+    $dumpvars ;
+
+    for (i = 0; i < 10; i = i + 1) begin
+      in = 10'b0000000001 << i;
+      #10;
+    end
+    $finish;
+    end
+ endmodule
+    

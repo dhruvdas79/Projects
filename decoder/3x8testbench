@@ -1,0 +1,21 @@
+module decoder_3x8_tb;
+  reg [2:0] in;
+  wire [7:0] out;
+  decoder_3x8 uut(
+    .in(in),
+    .out(out)
+  );
+  initial begin
+    $dumpfile("decoder_3x8.vcd");
+    $dumpvars;
+  end
+  integer i;
+  initial begin
+    for(i=0;i<8;i++)begin
+      in=i[2:0];
+      #10;
+    end
+    $finish;
+  end
+endmodule
+    

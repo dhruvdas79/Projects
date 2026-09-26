@@ -1,0 +1,42 @@
+module door_controller_tb;
+
+    reg clk;
+    reg rst;
+    reg motion;
+    reg door_close;
+    wire open;
+    wire close;
+
+    door_controller uut (
+        .clk(clk),
+        .rst(rst),
+        .motion(motion),
+        .door_close(door_close),
+        .open(open),
+        .close(close)
+    );
+
+    initial begin
+        $dumpfile("door_controller.vcd");
+        $dumpvars );
+    end
+
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    initial begin
+        rst = 1;
+        motion = 0;
+        door_close = 1;
+        #10;
+        rst = 0;
+        #10 motion = 1;
+        #10 motion = 0;
+        #100 door_close = 0;
+        #20 door_close = 1;
+        #100 $finish;
+    end
+
+endmodule

@@ -1,0 +1,27 @@
+ module priorityenc_tb;
+  reg [3:0] in;
+  wire [1:0] out;
+  wire valid;
+
+  priorityenc uut (
+    .in(in),
+    .out(out),
+    .valid(valid)
+  );
+
+  integer i;
+
+  initial begin
+    $dumpfile("priorityenc_tb.vcd");
+    $dumpvars;
+
+    for (i = 0; i < 16; i = i + 1) begin
+      in = i[3:0];
+      #10;
+    end
+
+    $finish;
+  end
+endmodule
+
+    

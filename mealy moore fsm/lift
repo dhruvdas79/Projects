@@ -1,0 +1,45 @@
+ module lift (
+    input clk,
+    input rst,
+    input req1,
+    input req2,
+    input req3,
+    output reg [1:0] current_floor
+);
+
+    typedef enum reg [1:0] {
+        FLOOR1 = 2'b00,
+        FLOOR2 = 2'b01,
+        FLOOR3 = 2'b10
+    } floor;
+
+    floor present_state, next_state;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            present_state <= FLOOR1;
+        else
+            present_state <= next_state;
+    end
+
+    always @(*) begin
+        case (present_state)
+            FLOOR1: next_state = (req2 || req3) ? FLOOR2 : FLOOR1;
+            FLOOR2: begin
+                if (req3)
+                    next_state = FLOOR3;
+                else if (req1)
+                    next_state = FLOOR1;
+                else
+                    next_state = FLOOR2;
+            end
+            FLOOR3: next_state = (req1 || req2) ? FLOOR2 : FLOOR3;
+            default: next_state = FLOOR1;
+        endcase
+    end
+
+    always @(*) begin
+        current_floor = present_state;
+    end
+
+endmodule

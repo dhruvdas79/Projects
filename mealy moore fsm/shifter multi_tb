@@ -1,0 +1,27 @@
+module  shifter_multi_tb;
+
+    reg  [31:0] in;
+    reg  [4:0]  shift;
+    reg  sel;
+    wire [31:0] out;
+
+  shifter_multi uut (
+        .in(in),
+        .shift(shift),
+        .sel (sel ),
+        .out(out)
+    );
+
+    initial begin
+        $dumpfile("shifter_multi.vcd");
+        $dumpvars ;
+
+        in = 32'h00000001; sel = 0; shift = 1; #10;
+        shift = 8; #10;
+        sel = 1; shift = 1; in = 32'h80000000; #10;
+        shift = 4; #10;
+        shift = 31; #10;
+
+        $finish;
+    end
+endmodule

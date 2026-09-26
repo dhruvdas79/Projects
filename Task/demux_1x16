@@ -1,0 +1,20 @@
+module demux_16x1(
+  output reg [15:0] data;
+  input [3:0] sel;
+  input out;
+  task mux;
+    output reg [15:0] data;
+    input [3:0] sel;
+    input o;
+    begin 
+      data=16'b0;
+      data[sel]=out;
+    end
+  endtask
+  always@(*)begin
+    mux(data, sel, out);  
+
+  end
+  endmodule 
+        
+  

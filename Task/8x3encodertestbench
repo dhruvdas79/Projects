@@ -1,0 +1,23 @@
+module encoder_8x3_tb;
+  reg [7:0] in;
+  wire [2:0] out;
+  wire valid;
+  
+  encoder_8x3 uut(
+    .in(in),
+    .out(out),
+    .valid(valid)
+  );
+  initial begin
+    $dumpfile("encoder_8x3.vcd");
+    $dumpvars();
+  end
+  integer i;
+  initial begin
+    for(i=0;i<8;i++)begin
+      in=8'b00000001<<i;
+    #10;
+  end
+  $finish;
+  end
+endmodule

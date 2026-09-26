@@ -1,0 +1,20 @@
+module encoder_4x2_tb;
+  reg [3:0] in;
+  wire [1:0] out;
+  encoder_4x2 uut(
+    .in(in),
+    .out(out)
+  );
+  integer i,j;
+  initial begin
+    $dumpfile("encoder_4x2");
+    $dumpvars;
+  end
+  initial begin
+    for(i=0;i<16;i++) begin
+      in=i[3:0];
+      #10;
+    end
+    $finish;
+  end
+endmodule

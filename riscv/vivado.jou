@@ -1,0 +1,14 @@
+#-----------------------------------------------------------
+# Vivado v2019.1 (64-bit)
+# SW Build 2552052 on Fri May 24 14:49:42 MDT 2019
+# IP Build 2548770 on Fri May 24 18:01:18 MDT 2019
+# Start of session at: Mon Dec 29 15:47:42 2025
+# Process ID: 21200
+# Current directory: C:/sillycon/riscv
+# Command line: vivado.exe -gui_launcher_event rodinguilauncherevent35200 C:\sillycon\riscv\riscv.xpr
+# Log file: C:/sillycon/riscv/vivado.log
+# Journal file: C:/sillycon/riscv\vivado.jou
+#-----------------------------------------------------------
+start_gui
+open_project C:/sillycon/riscv/riscv.xpr
+update_compile_order -fileset sources_1

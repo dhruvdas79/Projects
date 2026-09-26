@@ -1,0 +1,20 @@
+module dff( input clk,
+           input d,
+           output q);
+  reg q_int;
+  initial q_int=0;
+  always@(posedge clk)begin
+    q_int<=d;
+  end
+    assign q=q_int;
+      endmodule
+      module sipo( input in,
+                  input clk,
+                  output [3:0] out);
+        wire q0,q1,q2;
+        dff f0(clk,in,out[0]);
+        dff f1(clk,out[0],out[1]);
+        dff f2(clk,out[1],out[2]);
+        dff f3(clk,out[2],out[3]);
+      endmodule
+    

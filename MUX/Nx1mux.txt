@@ -1,0 +1,12 @@
+ module mux_nx1 #(
+  parameter N = 8                           
+)(
+  input      [N-1:0] in,                     
+  input      [$clog2(N)-1:0] sel,             
+  output reg out                              
+);
+  always @(*) begin
+    out = in[sel];
+  end
+endmodule
+

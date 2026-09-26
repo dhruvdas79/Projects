@@ -1,0 +1,11 @@
+module demux_2x1 (
+  input in,
+  input sel,
+  output out0,
+  output out1
+);
+
+  assign out0 = ~sel & in;
+  assign out1 = sel & in;
+
+endmodule

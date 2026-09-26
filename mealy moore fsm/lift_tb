@@ -1,0 +1,35 @@
+module lift_tb;
+
+    reg clk;
+    reg rst;
+    reg req1, req2, req3;
+    wire [1:0] current_floor;
+
+    lift uut (
+        .clk(clk),
+        .rst(rst),
+        .req1(req1),
+        .req2(req2),
+        .req3(req3),
+        .current_floor(current_floor)
+    );
+
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    initial begin
+        rst = 1;
+        req1 = 0; req2 = 0; req3 = 0;
+        #10 rst = 0;
+        #10 req2 = 1;
+        #10 req2 = 0;
+        #20 req3 = 1;
+        #10 req3 = 0;
+        #30 req1 = 1;
+        #10 req1 = 0;
+        #50 $finish;
+    end
+
+endmodule

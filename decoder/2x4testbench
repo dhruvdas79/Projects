@@ -1,0 +1,21 @@
+module decoder_2x4_tb;
+  reg [1:0] in;
+  wire [3:0] out;
+  decoder_2x4 uut(
+    .in(in),
+    .out(out)
+  );
+  initial begin
+    $dumpfile("decoder_2x4.vcd");
+    $dumpvars;
+  end
+  integer i;
+  initial begin
+    for(i=0;i<4;i++)begin
+      in=i[1:0];
+      #10;
+    end
+    $finish;
+  end
+endmodule
+    

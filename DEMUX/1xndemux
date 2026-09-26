@@ -1,0 +1,17 @@
+module demux1xn #(
+  parameter N = 4
+)(
+  input in,
+  input [$clog2(N)-1:0] sel,
+  output reg [N-1:0] out
+);
+
+  integer i;
+  always @(*) begin
+    for (i = 0; i < N; i = i + 1)
+      out[i] = 0;
+
+    out[sel] = in;
+  end
+
+endmodule

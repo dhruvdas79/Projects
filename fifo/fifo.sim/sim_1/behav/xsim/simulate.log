@@ -1,0 +1,224 @@
+Vivado Simulator 2019.1
+Time resolution is 1 ps
+|| Write ptr:xxxx || Write Enable:0 || Read ptr:xxxx || Read Enable:0 || Input Data:         0 || Ouput Data:         x || FIFO Full? : x || FIFO Empty? : x ||
+FIFO Register file value:
+
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0000 || Write Enable:0 || Read ptr:0000 || Read Enable:0 || Input Data:         0 || Ouput Data:         0 || FIFO Full? : 0 || FIFO Empty? : 1 ||
+FIFO Register file value:
+
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0000 || Write Enable:0 || Read ptr:0000 || Read Enable:0 || Input Data:         0 || Ouput Data:         0 || FIFO Full? : 0 || FIFO Empty? : 1 ||
+FIFO Register file value:
+
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0000 || Write Enable:1 || Read ptr:0000 || Read Enable:0 || Input Data:         1 || Ouput Data:         0 || FIFO Full? : 0 || FIFO Empty? : 1 ||
+FIFO Register file value:
+
+| 1 | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0001 || Write Enable:1 || Read ptr:0000 || Read Enable:0 || Input Data:         2 || Ouput Data:         0 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0010 || Write Enable:0 || Read ptr:0000 || Read Enable:1 || Input Data:         2 || Ouput Data:         0 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0010 || Write Enable:0 || Read ptr:0001 || Read Enable:1 || Input Data:         2 || Ouput Data:         1 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0010 || Write Enable:1 || Read ptr:0010 || Read Enable:0 || Input Data:         3 || Ouput Data:         2 || FIFO Full? : 0 || FIFO Empty? : 1 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| x | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0011 || Write Enable:1 || Read ptr:0010 || Read Enable:0 || Input Data:         4 || Ouput Data:         2 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0100 || Write Enable:0 || Read ptr:0010 || Read Enable:1 || Input Data:         4 || Ouput Data:         2 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0100 || Write Enable:0 || Read ptr:0011 || Read Enable:1 || Input Data:         4 || Ouput Data:         3 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| x | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0100 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         5 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 1 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| x | 
+| x | 
+| x | 
+|| Write ptr:0101 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         6 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| x | 
+| x | 
+|| Write ptr:0110 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         7 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| x | 
+|| Write ptr:0111 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         8 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 1 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0000 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         9 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 9 | 
+| 2 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0001 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         0 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 9 | 
+| 0 | 
+| 3 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0010 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         1 || Ouput Data:         4 || FIFO Full? : 0 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 9 | 
+| 0 | 
+| 1 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0011 || Write Enable:1 || Read ptr:0100 || Read Enable:0 || Input Data:         2 || Ouput Data:         4 || FIFO Full? : 1 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 9 | 
+| 0 | 
+| 1 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0011 || Write Enable:0 || Read ptr:0100 || Read Enable:0 || Input Data:         2 || Ouput Data:         4 || FIFO Full? : 1 || FIFO Empty? : 0 ||
+FIFO Register file value:
+
+| 9 | 
+| 0 | 
+| 1 | 
+| 4 | 
+| 5 | 
+| 6 | 
+| 7 | 
+| 8 | 
+|| Write ptr:0011 || Write Enable:0 || Read ptr:0100 || Read Enable:0 || Input Data:         2 || Ouput Data:         4 || FIFO Full? : 1 || FIFO Empty? : 0 ||
+$finish called at time : 200 ns : File "C:/sillycon/fifo/fifo.srcs/sim_1/new/tb_fifo.v" Line 72

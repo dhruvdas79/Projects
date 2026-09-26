@@ -1,0 +1,26 @@
+module traffic_tb;
+
+    reg clk;
+    reg rst;
+    wire NS;
+    wire EW;
+
+    traffic uut (
+        .clk(clk),
+        .rst(rst),
+        .NS(NS),
+        .EW(EW)
+    );
+
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk;
+    end
+
+    initial begin
+        rst = 1;
+        #10 rst = 0;
+        #100 $finish;
+    end
+
+endmodule

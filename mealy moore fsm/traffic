@@ -1,0 +1,42 @@
+ module traffic (
+    input clk,
+    input rst,
+    output reg NS,
+    output reg EW
+);
+
+    typedef enum reg [1:0] {
+        GREEN_NS = 2'b00,
+        GREEN_EW = 2'b01
+    } signal;
+
+    signal current_signal, next_signal;
+    reg [2:0] count;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            current_signal <= GREEN_NS;
+            count <= 0;
+        end else begin
+            current_signal <= next_signal;
+            count <= (current_signal != next_signal) ? 0 : count + 1;
+        end
+    end
+
+    always @(*) begin
+        case (current_signal)
+            GREEN_NS: next_signal = (count == 4) ? GREEN_EW : GREEN_NS;
+            GREEN_EW: next_signal = (count == 4) ? GREEN_NS : GREEN_EW;
+            default:  next_signal = GREEN_NS;
+        endcase
+    end
+
+    always @(*) begin
+        case (current_signal)
+            GREEN_NS: begin NS = 1; EW = 0; end
+            GREEN_EW: begin NS = 0; EW = 1; end
+            default:  begin NS = 0; EW = 0; end
+        endcase
+    end
+
+endmodule

@@ -1,0 +1,25 @@
+module  shifter_left_tb;
+
+    reg  [31:0] in;
+    reg  [4:0]  shift;
+    wire [31:0] out;
+
+    shifter_left uut (
+        .in(in),
+        .shift(shift),
+        .out(out)
+    );
+
+    initial begin
+        $dumpfile("shifter_left.vcd");
+        $dumpvars ;
+
+        in = 32'h00000001; shift = 0; #10;
+        shift = 1; #10;
+        shift = 4; #10;
+        shift = 8; #10;
+        shift = 16; #10;
+        shift = 31; #10;
+        $finish;
+    end
+endmodule

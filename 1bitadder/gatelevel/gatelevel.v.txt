@@ -1,0 +1,11 @@
+ 
+module fa(a,b,cin,cout,sum);
+  input a,b,cin;
+  output cout,sum;
+  wire k,t1,t2;
+  xor g1(k,a,b);
+  xor g2(sum,k,cin);
+  and j1(t1,k,cin);
+  and j2(t2,a,b);
+  or o1(cout,t1,t2);
+endmodule

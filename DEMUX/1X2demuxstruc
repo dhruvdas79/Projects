@@ -1,0 +1,21 @@
+module and_gate(input a, input b, output y);
+  assign y = a & b;
+endmodule
+
+module not_gate(input a, output y);
+  assign y = ~a;
+endmodule
+
+module demux_2x1  (
+  input in,
+  input sel,
+  output out0,
+  output out1
+);
+  wire nsel;
+
+  not_gate u1 (.a(sel), .y(nsel));
+  and_gate u2 (.a(in), .b(nsel), .y(out0));
+  and_gate u3 (.a(in), .b(sel),  .y(out1));
+
+endmodule

@@ -1,0 +1,27 @@
+ module array_tb;
+
+  reg  [15:0] a, b;
+  wire [31:0] product;
+
+  array uut (
+    .a(a),
+    .b(b),
+    .product(product)
+  );
+
+  integer i;
+
+  initial begin
+    $dumpfile("array.vcd");
+    $dumpvars(0, array_tb);
+
+    for (i = 0; i < 256; i = i + 1) begin
+      a = i * 257;
+      b = i * 256;
+      #10;
+    end
+
+    $finish;
+  end
+
+endmodule

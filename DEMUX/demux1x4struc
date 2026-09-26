@@ -1,0 +1,37 @@
+ module demux_1x2(
+  input in,
+  input sel,
+  output out0,
+  output out1
+);
+  assign out0 = (~sel) & in;
+  assign out1 = sel & in;
+endmodule
+module demux_1x4(
+  input in,
+  input [1:0] sel,
+  output [3:0] out
+);
+  wire upper0, upper1;
+
+  demux_1x2 stage1 (
+    .in(in),
+    .sel(sel[1]),
+    .out0(upper0),
+    .out1(upper1)
+  );
+
+  demux_1x2 stage2 (
+    .in(upper0),
+    .sel(sel[0]),
+    .out0(out[0]),
+    .out1(out[1])
+  );
+
+  demux_1x2 stage3 (
+    .in(upper1),
+    .sel(sel[0]),
+    .out0(out[2]),
+    .out1(out[3])
+  );
+endmodule

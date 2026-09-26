@@ -1,0 +1,39 @@
+
+module pattern_tb;
+
+    reg clk;
+    reg in;
+    reg rst;
+    wire detected;
+
+    pattern dut (
+        .clk(clk),
+        .in(in),
+        .rst(rst),
+        .detected(detected)
+    );
+
+    always #5 clk = ~clk;
+
+    reg [31:0] bitstream = 32'b00110011001101101100110011001100;
+    integer i;
+
+    initial begin
+        $dumpfile("pattern.vcd");
+        $dumpvars;
+
+        clk = 0;
+        rst = 1;
+        in  = 0;
+
+        #12 rst = 0;
+
+        for (i = 0; i < 32; i = i + 1) begin
+            in = bitstream[i];
+            #10;
+        end
+
+        #20 $finish;
+    end
+
+endmodule

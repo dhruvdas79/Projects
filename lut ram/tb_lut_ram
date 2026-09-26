@@ -1,0 +1,64 @@
+ `timescale 1ns / 1ps
+module tb_LUT_ram();
+    parameter W = 32;  
+    parameter D = 8;   
+    reg clk;
+    reg write_en;
+    reg [W-1:0] data_in;
+    reg [$clog2(D)-1:0] write_addr, read_addr;
+    wire [W-1:0] out;
+
+    LUT_ram #(.W(W), .D(D)) dut (
+        .clk(clk),
+        .write_en(write_en),
+        .data_in(data_in),
+        .write_addr(write_addr),
+        .read_addr(read_addr),
+        .out(out)
+    );
+    
+    always #5 clk = ~clk;
+    
+    initial begin
+        $dumpfile("lut_ram.vcd");
+        $dumpvars(0, tb_LUT_ram);
+        clk = 0;
+        
+        ////////// INITIALIZING //////////
+        write_en = 0;
+        data_in = 0;
+        write_addr = 0;
+        read_addr = 0;
+        
+        ////////// WRITTING //////////
+        #10;
+        write_en = 1;
+        data_in = 32'hDEADBEEF;
+        write_addr = 2;
+        
+        #10;
+        data_in = 32'hCAFEBABE;
+        write_addr = 5;
+        
+        ////////// READING //////////
+        #10;
+        write_en = 0;
+        read_addr = 2;  
+        
+        #10;
+        read_addr = 5;
+        
+        ////////// WRITE/READ SAME ADDR //////////
+        #10;
+        write_en = 1;
+        write_addr = 3;
+        data_in = 32'h12345678;
+        read_addr = 3; 
+        
+        #10;
+        write_en = 0;
+        read_addr = 3;
+        
+        #20 $finish;
+    end
+endmodule

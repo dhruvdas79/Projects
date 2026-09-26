@@ -1,0 +1,44 @@
+ `timescale 1ns / 1ps
+
+module fifo #(parameter w = 32, parameter d = 8)(
+    input clk,
+    input rst,
+    input r_en,
+    input w_en,
+    input [w-1:0] w_data,
+    output reg [w-1:0] r_data,
+    output reg full,
+    output reg empty
+);
+
+    reg [w-1:0] reg_fifo [0:d-1];
+    reg [$clog2(d):0] r_ptr, w_ptr;
+
+    always @(*) begin
+        	empty = (w_ptr == r_ptr);
+    full  = ((w_ptr+1)%d) == r_ptr;
+
+    end
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            r_ptr <= 0;
+            w_ptr <= 0;
+            r_data <= 0;
+        end else begin
+            if (r_en && w_en && !empty && !full) begin
+                reg_fifo[w_ptr] <= w_data;
+                w_ptr <= (w_ptr + 1) % d;
+                r_data <= reg_fifo[r_ptr];
+                r_ptr <= (r_ptr + 1) % d;
+            end else if (r_en && !empty) begin
+                r_data <= reg_fifo[r_ptr];
+                r_ptr <= (r_ptr + 1) % d;
+            end else if (w_en && !full) begin
+                reg_fifo[w_ptr] <= w_data;
+                w_ptr <= (w_ptr + 1) % d;
+            end
+        end
+    end
+
+endmodule

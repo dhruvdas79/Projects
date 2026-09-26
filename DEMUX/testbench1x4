@@ -1,0 +1,26 @@
+module demux_1x4_tb;
+  reg in;
+  reg [1:0] sel;
+  wire [3:0] out;
+
+  demux_1x4 uut (
+    .in(in),
+    .sel(sel),
+    .out(out)
+  );
+
+  integer i;
+
+  initial begin
+    $dumpfile("demux_1x4.vcd");
+    $dumpvars(0, demux_1x4_tb);
+
+    in = 1'b1;
+    for (i = 0; i < 4; i = i + 1) begin
+      sel = i[1:0];
+      #10;
+    end
+
+    $finish;
+  end
+endmodule

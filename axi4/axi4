@@ -1,0 +1,92 @@
+ module master(
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        t_ready,
+    output reg [15:0]  t_data,
+    output reg         t_valid,
+    output reg         t_last
+);
+
+    reg [15:0] storage;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            t_data  <= 16'd0;
+            t_valid <= 1'b0;
+            t_last  <= 1'b0;
+            storage <= 16'h0001;
+        end 
+        else begin
+            if (!t_valid && !t_last) begin
+                t_data  <= storage;
+                t_valid <= 1'b1;
+            end 
+            else if (t_ready && t_valid) begin
+                t_valid <= 1'b0;
+                t_last  <= 1'b1;
+                storage<=storage+1;
+            end 
+            else begin
+                t_last <= 1'b0;
+            end
+        end
+    end
+
+endmodule
+
+
+module slave(
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        t_valid,
+    input  wire [15:0] t_data,
+    input  wire        t_last,
+    output reg         t_ready,
+    output reg [15:0]  o_data
+);
+
+    always @(posedge clk) begin
+        if (rst) begin
+            t_ready <= 1'b0;
+            o_data  <= 16'd0;
+        end 
+        else begin
+            t_ready <= 1'b1;
+            if (t_valid && t_ready) begin
+                o_data <= t_data;
+            end
+        end
+    end
+
+endmodule
+module axi4(
+    input  wire clk,
+    input  wire rst,
+    output wire [15:0] slave_out
+);
+
+    wire [15:0] t_data;
+    wire        t_valid;
+    wire        t_last;
+    wire        t_ready;
+
+    master u_master (
+        .clk    (clk),
+        .rst    (rst),
+        .t_ready(t_ready),
+        .t_data (t_data),
+        .t_valid(t_valid),
+        .t_last (t_last)
+    );
+
+    slave u_slave (
+        .clk    (clk),
+        .rst    (rst),
+        .t_valid(t_valid),
+        .t_data (t_data),
+        .t_last (t_last),
+        .t_ready(t_ready),
+        .o_data (slave_out)
+    );
+
+endmodule

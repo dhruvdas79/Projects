@@ -1,0 +1,31 @@
+module boothmultiplier32_tb;
+    reg  signed [31:0] M;
+    reg  [31:0] Q;
+    reg         Qm1;
+    wire signed [63:0] result;
+    boothmultiplier32 uut (
+        .M(M),
+        .Q(Q),
+        .Qm1(Qm1),
+        .result(result)
+    );
+initial begin
+  $dumpfile("boothmultiplier32.vcd");
+  $dumpvars();
+end
+  initial begin
+    M= 32'sd5;
+        Q   = 32'd3;
+        Qm1 = 1'b0;
+    #10;
+      M   = -32'sd6;
+        Q   = -32'd2;
+        Qm1 = 1'b0;
+        #10;
+        M   = 32'd0;
+        Q   = 32'd12345;
+        Qm1 = 1'b0;
+        #10;
+    $finish;
+  end
+    endmodule

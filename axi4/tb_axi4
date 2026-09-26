@@ -1,0 +1,28 @@
+ module tb_axi4;
+    reg clk;
+    reg rst;
+    wire [15:0] slave_out;
+
+    axi4 uut (
+        .clk(clk),
+        .rst(rst),
+        .slave_out(slave_out)
+    );
+
+    always #10 clk = ~clk;
+
+    initial begin
+        $dumpfile("axi4.vcd");
+        $dumpvars(0, tb_axi4);
+
+        clk = 0;
+        rst = 1;
+
+        #30 rst = 0;
+
+        $monitor("Time=%0t | slave_out=%h", $time, slave_out);
+
+        #300;
+        $finish;
+    end
+endmodule

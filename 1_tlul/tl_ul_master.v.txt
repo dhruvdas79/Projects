@@ -1,0 +1,105 @@
+ `timescale 1ns / 1ps
+module a_tlul(
+    input    clk,
+    input    rst,
+    input    req_valid,
+    input   [1:0] req_op,
+    input    [15:0] req_addr,
+    input   [15:0] req_data,
+    input    [1:0]  req_mask,
+    output reg  a_valid,
+    input   a_ready,
+    output reg [2:0] a_opcode,
+    output reg [15:0] a_data,
+    output reg [1:0]  a_mask,
+    output reg [15:0] a_address,
+    output reg a_param,
+    output reg a_size,
+    output reg a_source,
+    input   d_valid,
+    input   [2:0] d_opcode,
+    input   d_error,
+    output reg  d_ready
+);
+//states
+    localparam IDLE    = 2'b00;
+    localparam WORKING = 2'b01;
+    localparam WAITING = 2'b10;
+//opcodes 
+    localparam GET        = 3'b100;
+    localparam PUTFULL    = 3'b000;
+    localparam PUTPARTIAL = 3'b001;
+
+    reg [1:0] state, next_state;
+    reg [2:0] op;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            state <= IDLE;
+        else
+            state <= next_state;
+    end
+
+    always @(*) begin
+        next_state = state;
+        a_valid    = 0;
+        d_ready    = 0;
+
+        case (state)
+            IDLE: begin
+                if (req_valid)
+                    next_state = WORKING;
+            end
+
+            WORKING: begin
+                a_valid = 1;
+                if (a_ready)
+                    next_state = WAITING;
+            end
+
+            WAITING: begin
+                d_ready = 1;
+                if (d_valid)
+                    next_state = IDLE;
+            end
+        endcase
+    end
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            a_opcode  <= 0;
+            a_address <= 0;
+            a_data    <= 0;
+            a_mask    <= 0;
+            a_param   <= 0;
+            a_size    <= 0;
+            a_source  <= 0;
+            op        <= 0;
+        end
+        else if (state == IDLE && req_valid) begin
+            a_address <= req_addr;
+            a_param   <= 0;
+            a_size    <= 1;
+            a_source  <= 0;
+            case (req_op)
+                2'b00: begin
+                    a_opcode <= GET;
+                    a_data   <= 0;
+                    a_mask   <= 2'b00;
+                    op       <= GET;
+                end
+                2'b01: begin
+                    a_opcode <= PUTPARTIAL;
+                    a_data   <= req_data;
+                    a_mask   <= req_mask;
+                    op       <= PUTPARTIAL;
+                end
+                2'b10: begin
+                    a_opcode <= PUTFULL;
+                    a_data   <= req_data;
+                    a_mask   <= 2'b11;
+                    op       <= PUTFULL;
+                end
+            endcase
+        end
+    end
+endmodule

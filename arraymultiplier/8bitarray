@@ -1,0 +1,14 @@
+module array(
+  input [7:0]a,b,
+  output [15:0] product
+);
+  
+  wire [15:0] partial [7:0];
+  generate
+  genvar i;
+    for(i=0;i<8;i++)begin:partialss
+      assign partial[i]=b[i]?(a<<i):16'b0;
+    end
+  endgenerate
+  assign product=partial[0]+partial[1]+partial[2]+partial[3]+partial[4]+partial[5]+partial[6]+partial[7];
+endmodule

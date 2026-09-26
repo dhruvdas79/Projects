@@ -1,0 +1,19 @@
+ module demux_1x16(
+  input in,
+  input [3:0] sel,
+  output [15:0] out
+);
+
+  function [15:0] outputt;
+    input in;
+    input [3:0] sel;
+    integer i;
+    begin
+      outputt = 16'b0;
+      outputt[sel] = in;
+    end
+  endfunction
+
+  assign out = outputt(in, sel);
+
+endmodule

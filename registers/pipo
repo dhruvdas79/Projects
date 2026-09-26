@@ -1,0 +1,18 @@
+module dff( input clk,
+           input d,
+           output q);
+  reg q_int;
+  always@(posedge clk)begin
+    q_int<=d;
+  end
+    assign q=q_int;
+      endmodule
+module pipo( input [3:0]in,
+                  input clk,
+                  output [3:0] out);
+  dff f0(clk,in[0],out[0]);
+  dff f1(clk,in[1],out[1]);
+  dff f2(clk,in[2],out[2]);
+  dff f3(clk,in[3],out[3]);
+      endmodule
+    

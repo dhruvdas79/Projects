@@ -1,0 +1,31 @@
+module boothmultiplier16_tb;
+  reg  signed [7:0] M;
+  reg  [7:0] Q;
+    reg         Qm1;
+  wire signed [15:0] result;
+    boothmultiplier16 uut (
+        .M(M),
+        .Q(Q),
+        .Qm1(Qm1),
+        .result(result)
+    );
+initial begin
+  $dumpfile("boothmultiplier16.vcd");
+  $dumpvars();
+end
+  initial begin
+    M= 8'sd5;
+        Q   = 8'd3;
+        Qm1 = 1'b0;
+    #10;
+      M   = -8'sd6;
+        Q   = -8'd2;
+        Qm1 = 1'b0;
+        #10;
+        M   = 8'd0;
+        Q   = 8'd12345;
+        Qm1 = 1'b0;
+        #10;
+    $finish;
+  end
+    endmodule
